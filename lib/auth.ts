@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
+
 import { supabase } from './supabase';
+
 import type { Session, User } from '@supabase/supabase-js';
 
 type AuthState = {
@@ -11,6 +13,7 @@ type AuthState = {
 let globalSession: Session | null = null;
 let globalUser: User | null = null;
 let globalLoading = false;
+
 let listeners: Set<() => void> = new Set();
 
 function notify() {
@@ -30,7 +33,10 @@ export function useAuth(): AuthState {
   useEffect(() => {
     const listener = () => forceRender((n) => n + 1);
     listeners.add(listener);
-    return () => { listeners.delete(listener); };
+
+    return () => {
+      listeners.delete(listener);
+    };
   }, []);
 
   return {
@@ -41,18 +47,39 @@ export function useAuth(): AuthState {
 }
 
 export async function signUp(email: string, password: string) {
-  const { data, error } = await supabase.auth.signUp({ email, password });
-  if (!error && data.session) {
-    setAuth(data.session);
+  console.log("SIGNUP START");
+  console.log("EMAIL:", email);
+
+  try {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+    });
+
+    console.log("SIGNUP DATA:", data);
+    console.log("SIGNUP ERROR:", error);
+
+    if (!error && data.session) {
+      setAuth(data.session);
+    }
+
+    return { data, error };
+  } catch (err) {
+    console.log("SIGNUP CATCH ERROR:", err);
+    throw err;
   }
-  return { data, error };
 }
 
 export async function signIn(email: string, password: string) {
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+
   if (!error && data.session) {
     setAuth(data.session);
   }
+
   return { data, error };
 }
 
