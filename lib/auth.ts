@@ -13,7 +13,6 @@ type AuthState = {
 let globalSession: Session | null = null;
 let globalUser: User | null = null;
 let globalLoading = false;
-
 let listeners: Set<() => void> = new Set();
 
 function notify() {
@@ -32,6 +31,7 @@ export function useAuth(): AuthState {
 
   useEffect(() => {
     const listener = () => forceRender((n) => n + 1);
+
     listeners.add(listener);
 
     return () => {
@@ -46,18 +46,34 @@ export function useAuth(): AuthState {
   };
 }
 
-export async function signUp(email: string, password: string) {
-  console.log("SIGNUP START");
-  console.log("EMAIL:", email);
+export type SignUpProfile = {
+  full_name: string;
+  role: 'student' | 'teacher';
+};
+
+export async function signUp(
+  email: string,
+  password: string,
+  profile?: SignUpProfile
+) {
+  console.log('SIGNUP START');
+  console.log('EMAIL:', email);
+  console.log('PROFILE:', profile);
 
   try {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
+      options: {
+        data: {
+          full_name: profile?.full_name ?? '',
+          role: profile?.role ?? 'student',
+        },
+      },
     });
 
-    console.log("SIGNUP DATA:", data);
-    console.log("SIGNUP ERROR:", error);
+    console.log('SIGNUP DATA:', data);
+    console.log('SIGNUP ERROR:', error);
 
     if (!error && data.session) {
       setAuth(data.session);
@@ -65,16 +81,17 @@ export async function signUp(email: string, password: string) {
 
     return { data, error };
   } catch (err) {
-    console.log("SIGNUP CATCH ERROR:", err);
+    console.log('SIGNUP CATCH ERROR:', err);
     throw err;
   }
 }
 
 export async function signIn(email: string, password: string) {
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
-  });
+  const { data, error } =
+    await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
 
   if (!error && data.session) {
     setAuth(data.session);
@@ -86,5 +103,6 @@ export async function signIn(email: string, password: string) {
 export async function signOut() {
   setAuth(null);
   supabase.auth.signOut().catch(() => {});
+
   return { error: null };
 }

@@ -9,7 +9,7 @@ export default function Header({ title }: Props) {
   return (
     <View style={styles.container}>
       <View style={styles.logoCircle}>
-        <MaterialIcons name="qr-code-2" size={36} color={COLORS.logo} />
+       <MaterialIcons name="qr-code-2" size={36} color={COLORS.primary} />
       </View>
       <Text style={styles.title}>{title}</Text>
     </View>

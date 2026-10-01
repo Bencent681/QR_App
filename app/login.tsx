@@ -22,6 +22,7 @@ import { signIn } from '@/lib/auth';
 export default function LoginScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -32,7 +33,10 @@ export default function LoginScreen() {
     setLoading(true);
 
     try {
-      const { data, error: authError } = await signIn(email.trim(), password);
+      const { data, error: authError } = await signIn(
+        email.trim(),
+        password
+      );
 
       if (authError) {
         setError(authError.message);
@@ -64,10 +68,14 @@ export default function LoginScreen() {
             </View>
 
             <Text style={styles.title}>Welcome Back</Text>
-            <Text style={styles.subtitle}>Sign in to record your attendance</Text>
+
+            <Text style={styles.subtitle}>
+              Sign in to record your attendance
+            </Text>
 
             <View style={styles.form}>
               <Text style={styles.label}>Email</Text>
+
               <TextInput
                 style={styles.input}
                 value={email}
@@ -80,6 +88,7 @@ export default function LoginScreen() {
               />
 
               <Text style={styles.label}>Password</Text>
+
               <TextInput
                 style={styles.input}
                 value={password}
@@ -93,7 +102,11 @@ export default function LoginScreen() {
               {error && <Text style={styles.error}>{error}</Text>}
 
               {loading ? (
-                <ActivityIndicator size="large" color={COLORS.primary} style={styles.loader} />
+                <ActivityIndicator
+                  size="large"
+                  color={COLORS.primary}
+                  style={styles.loader}
+                />
               ) : (
                 <AppButton
                   theme="primary"
@@ -119,35 +132,43 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.background,
   },
+
   keyboardView: {
     flex: 1,
   },
+
   scrollContent: {
     flexGrow: 1,
     paddingHorizontal: 24,
     paddingBottom: 40,
   },
+
   headerContainer: {
     alignItems: 'center',
     marginTop: 20,
-    marginBottom: 16,
+    marginBottom: 24,
   },
+
   title: {
-    fontSize: 24,
+    fontSize: 28,
     fontWeight: '700',
     color: COLORS.textPrimary,
-    textAlign: 'center',
-    marginBottom: 4,
+    textAlign: 'left',
+    marginBottom: 6,
   },
+
   subtitle: {
-    fontSize: 14,
+    fontSize: 15,
+    lineHeight: 21,
     color: COLORS.textSecondary,
-    textAlign: 'center',
+    textAlign: 'left',
     marginBottom: 32,
   },
+
   form: {
     marginBottom: 24,
   },
+
   label: {
     fontSize: 14,
     fontWeight: '600',
@@ -155,26 +176,30 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     marginTop: 10,
   },
+
   input: {
     backgroundColor: COLORS.card,
-    borderRadius: 14,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: COLORS.border,
     paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 15,
+    paddingVertical: 13,
+    fontSize: 16,
     color: COLORS.textPrimary,
   },
+
   error: {
     fontSize: 14,
-    color: '#C62828',
-    textAlign: 'center',
+    color: COLORS.danger,
+    textAlign: 'left',
     marginTop: 12,
     marginBottom: 4,
   },
+
   loader: {
     marginVertical: 16,
   },
+
   link: {
     fontSize: 14,
     color: COLORS.primary,
