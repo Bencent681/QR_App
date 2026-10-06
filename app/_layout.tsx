@@ -1,8 +1,4 @@
-import {
-  Redirect,
-  Stack,
-  useSegments,
-} from 'expo-router';
+import { Redirect, Stack, useSegments } from 'expo-router';
 
 import {
   ActivityIndicator,
@@ -11,7 +7,6 @@ import {
 } from 'react-native';
 
 import { COLORS } from '@/constants/colors';
-
 import { useAuth } from '@/lib/auth';
 
 export default function RootLayout() {
@@ -37,18 +32,21 @@ export default function RootLayout() {
 
   const inTabsGroup = path === '(tabs)';
 
+  // Redirect BEFORE rendering the Stack
+  if (!session && inTabsGroup) {
+    return <Redirect href="/login" />;
+  }
+
+  if (session && inAuthGroup) {
+    return <Redirect href="/(tabs)" />;
+  }
+
   return (
     <Stack
-      screenOptions={{ headerShown: false }}
+      screenOptions={{
+        headerShown: false,
+      }}
     >
-      {!session && inTabsGroup && (
-        <Redirect href="/login" />
-      )}
-
-      {session && inAuthGroup && (
-        <Redirect href="/(tabs)" />
-      )}
-
       <Stack.Screen name="login" />
       <Stack.Screen name="register" />
       <Stack.Screen name="(tabs)" />
