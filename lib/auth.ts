@@ -1,3 +1,4 @@
+
 import { useState, useEffect } from 'react';
 
 import { supabase } from './supabase';
@@ -13,16 +14,18 @@ type AuthState = {
 let globalSession: Session | null = null;
 let globalUser: User | null = null;
 let globalLoading = false;
-let listeners: Set<() => void> = new Set();
+
+const listeners: Set<() => void> = new Set();
 
 function notify() {
-  listeners.forEach((l) => l());
+  listeners.forEach((listener) => listener());
 }
 
 export function setAuth(session: Session | null) {
   globalSession = session;
   globalUser = session?.user ?? null;
   globalLoading = false;
+
   notify();
 }
 
@@ -30,7 +33,9 @@ export function useAuth(): AuthState {
   const [, forceRender] = useState(0);
 
   useEffect(() => {
-    const listener = () => forceRender((n) => n + 1);
+    const listener = () => {
+      forceRender((n) => n + 1);
+    };
 
     listeners.add(listener);
 
@@ -56,18 +61,29 @@ export async function signUp(
   password: string,
   profile?: SignUpProfile
 ) {
+  const normalizedEmail = email.trim();
+  const fullName = profile?.full_name?.trim() ?? '';
+  const role = profile?.role ?? 'student';
+
   console.log('SIGNUP START');
-  console.log('EMAIL:', email);
-  console.log('PROFILE:', profile);
+  console.log('EMAIL:', normalizedEmail);
+  console.log('PROFILE:', { full_name: fullName, role });
 
   try {
+    if (!fullName) {
+      return {
+        data: null,
+        error: new Error('Please enter your full name.'),
+      };
+    }
+
     const { data, error } = await supabase.auth.signUp({
-      email,
+      email: normalizedEmail,
       password,
       options: {
         data: {
-          full_name: profile?.full_name ?? '',
-          role: profile?.role ?? 'student',
+          full_name: fullName,
+          role,
         },
       },
     });
@@ -75,34 +91,115 @@ export async function signUp(
     console.log('SIGNUP DATA:', data);
     console.log('SIGNUP ERROR:', error);
 
-    if (!error && data.session) {
+    if (error) {
+      return {
+        data,
+        error,
+      };
+    }
+
+    const user = data.user;
+
+    if (!user) {
+      return {
+        data,
+        error: new Error(
+          'Signup did not return a user. Please try again.'
+        ),
+      };
+    }
+
+    /*
+     * The Supabase database trigger should create
+     * the profiles row using the Auth metadata.
+     *
+     * No client-side profiles upsert is performed
+     * here, because email confirmation may be pending
+     * and the user may not have an authenticated session.
+     */
+
+    if (data.session) {
       setAuth(data.session);
     }
 
-    return { data, error };
+    return {
+      data,
+      error: null,
+    };
   } catch (err) {
-    console.log('SIGNUP CATCH ERROR:', err);
-    throw err;
+    console.error('SIGNUP CATCH ERROR:', err);
+
+    return {
+      data: null,
+      error:
+        err instanceof Error
+          ? err
+          : new Error('Signup failed. Please try again.'),
+    };
   }
 }
 
-export async function signIn(email: string, password: string) {
-  const { data, error } =
-    await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
+export async function signIn(
+  email: string,
+  password: string
+) {
+  try {
+    const { data, error } =
+      await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
 
-  if (!error && data.session) {
-    setAuth(data.session);
+    console.log('SIGNIN DATA:', data);
+    console.log('SIGNIN ERROR:', error);
+
+    if (error) {
+      return {
+        data,
+        error,
+      };
+    }
+
+    if (data.session) {
+      setAuth(data.session);
+    }
+
+    return {
+      data,
+      error: null,
+    };
+  } catch (err) {
+    console.error('SIGNIN CATCH ERROR:', err);
+
+    return {
+      data: null,
+      error:
+        err instanceof Error
+          ? err
+          : new Error('Login failed. Please try again.'),
+    };
   }
-
-  return { data, error };
 }
 
 export async function signOut() {
-  setAuth(null);
-  supabase.auth.signOut().catch(() => {});
+  try {
+    const { error } = await supabase.auth.signOut();
 
-  return { error: null };
+    if (!error) {
+      setAuth(null);
+    }
+
+    return {
+      error,
+    };
+  } catch (err) {
+    console.error('SIGNOUT ERROR:', err);
+
+    return {
+      error:
+        err instanceof Error
+          ? err
+          : new Error('Logout failed. Please try again.'),
+    };
+  }
 }
