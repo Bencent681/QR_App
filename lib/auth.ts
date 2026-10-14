@@ -1,5 +1,5 @@
 
-import { useState, useEffect } from 'react';
+import { useSyncExternalStore } from 'react';
 
 import { supabase } from './supabase';
 
@@ -13,42 +13,94 @@ type AuthState = {
 
 let globalSession: Session | null = null;
 let globalUser: User | null = null;
-let globalLoading = false;
+let globalLoading = true;
+let authRevision = 0;
 
 const listeners: Set<() => void> = new Set();
+let authState: AuthState = {
+  session: globalSession,
+  user: globalUser,
+  loading: globalLoading,
+};
 
 function notify() {
   listeners.forEach((listener) => listener());
 }
 
-export function setAuth(session: Session | null) {
-  globalSession = session;
-  globalUser = session?.user ?? null;
-  globalLoading = false;
-
-  notify();
-}
-
-export function useAuth(): AuthState {
-  const [, forceRender] = useState(0);
-
-  useEffect(() => {
-    const listener = () => {
-      forceRender((n) => n + 1);
-    };
-
-    listeners.add(listener);
-
-    return () => {
-      listeners.delete(listener);
-    };
-  }, []);
-
-  return {
+function publishAuthState() {
+  authState = {
     session: globalSession,
     user: globalUser,
     loading: globalLoading,
   };
+  notify();
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function getAuthState() {
+  return authState;
+}
+
+export function setAuth(session: Session | null) {
+  authRevision += 1;
+  globalSession = session;
+  globalUser = session?.user ?? null;
+  globalLoading = false;
+  publishAuthState();
+}
+
+export function initializeAuth() {
+  let active = true;
+  const restoreRevision = authRevision;
+
+  globalLoading = true;
+  publishAuthState();
+
+  const {
+    data: { subscription },
+  } = supabase.auth.onAuthStateChange((_event, session) => {
+    if (active) {
+      setAuth(session);
+    }
+  });
+
+  void supabase.auth
+    .getSession()
+    .then(({ data, error }) => {
+      if (!active || authRevision !== restoreRevision) {
+        return;
+      }
+
+      if (error) {
+        console.error('AUTH SESSION RESTORE ERROR:', error);
+      }
+
+      setAuth(error ? null : data.session);
+    })
+    .catch((error) => {
+      if (!active || authRevision !== restoreRevision) {
+        return;
+      }
+
+      console.error('AUTH SESSION RESTORE ERROR:', error);
+      setAuth(null);
+    });
+
+  return () => {
+    active = false;
+    subscription.unsubscribe();
+  };
+}
+
+export function useAuth(): AuthState {
+  return useSyncExternalStore(subscribe, getAuthState, getAuthState);
 }
 
 export type SignUpProfile = {

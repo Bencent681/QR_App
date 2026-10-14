@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { router, useFocusEffect } from 'expo-router';
 import {
   ActivityIndicator,
+  Modal,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -13,12 +14,35 @@ import {
 import Ionicons from '@expo/vector-icons/Ionicons';
 
 import AppButton from '@/components/AppButton';
-import Header from '@/components/Header';
 import { COLORS } from '@/constants/colors';
 import { useAuth } from '@/lib/auth';
-import { getTeacherDashboardData } from '@/lib/attendance';
+import {
+  getAttendanceHistory,
+  getTeacherDashboardData,
+  type AttendanceRecord,
+} from '@/lib/attendance';
 import type { CloudEvent } from '@/lib/events';
 import { getProfile, type Role } from '@/lib/profiles';
+import { supabase } from '@/lib/supabase';
+
+type StudentEvent = {
+  id: string;
+  title: string;
+  start_time: string;
+  end_time: string;
+};
+
+const STUDENT_DASHBOARD_COLORS = {
+  primary: COLORS.primary,
+  primaryDark: COLORS.primaryDark,
+  primaryLight: COLORS.primaryLight,
+  background: COLORS.background,
+  card: COLORS.card,
+  text: COLORS.textPrimary,
+  secondaryText: COLORS.textSecondary,
+  border: COLORS.border,
+  success: COLORS.success,
+} as const;
 
 function formatEventDate(value: string | null) {
   if (!value) {
@@ -39,6 +63,30 @@ function formatEventDate(value: string | null) {
   });
 }
 
+function getStudentEventStatus(
+  event: StudentEvent,
+  now = Date.now()
+) {
+  return now < new Date(event.start_time).getTime()
+    ? 'Upcoming' as const
+    : 'Ongoing' as const;
+}
+
+function formatStudentEventTime(value: string) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return 'Time unavailable';
+  }
+
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
 export default function Index() {
   const { user } = useAuth();
   const [role, setRole] = useState<Role | null>(null);
@@ -46,6 +94,13 @@ export default function Index() {
   const [attendanceCount, setAttendanceCount] = useState<number | null>(null);
   const [dashboardLoading, setDashboardLoading] = useState(true);
   const [dashboardError, setDashboardError] = useState(false);
+  const [studentEvents, setStudentEvents] = useState<StudentEvent[]>([]);
+  const [studentAttendance, setStudentAttendance] = useState<AttendanceRecord[]>([]);
+  const [studentDashboardLoading, setStudentDashboardLoading] = useState(true);
+  const [studentDashboardError, setStudentDashboardError] = useState(false);
+  const [showAllEvents, setShowAllEvents] = useState(false);
+  const [selectedStudentEvent, setSelectedStudentEvent] =
+    useState<StudentEvent | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -119,6 +174,73 @@ export default function Index() {
             setDashboardLoading(false);
           }
         });
+
+      return () => {
+        active = false;
+      };
+    }, [role, user?.id])
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+
+      if (role !== 'student' || !user) {
+        setStudentEvents([]);
+        setStudentAttendance([]);
+        setStudentDashboardLoading(false);
+        setShowAllEvents(false);
+        setSelectedStudentEvent(null);
+
+        return () => {
+          active = false;
+        };
+      }
+
+      const studentId = user.id;
+      setStudentDashboardLoading(true);
+      setStudentDashboardError(false);
+
+      async function loadStudentDashboard() {
+        try {
+          const [eventsResult, attendanceRecords] = await Promise.all([
+            supabase
+              .from('events')
+              .select('id, title, start_time, end_time')
+              .not('start_time', 'is', null)
+              .not('end_time', 'is', null)
+              .gte('end_time', new Date().toISOString())
+              .order('start_time', { ascending: true }),
+            getAttendanceHistory(studentId),
+          ]);
+
+          if (!active) return;
+
+          if (eventsResult.error) {
+            console.log('STUDENT UPCOMING EVENTS ERROR:', eventsResult.error);
+            setStudentEvents([]);
+            setStudentDashboardError(true);
+          } else {
+            setStudentEvents((eventsResult.data ?? []) as StudentEvent[]);
+          }
+
+          setStudentAttendance(attendanceRecords);
+        } catch (error) {
+          console.log('STUDENT DASHBOARD LOAD ERROR:', error);
+
+          if (active) {
+            setStudentEvents([]);
+            setStudentAttendance([]);
+            setStudentDashboardError(true);
+          }
+        } finally {
+          if (active) {
+            setStudentDashboardLoading(false);
+          }
+        }
+      }
+
+      loadStudentDashboard();
 
       return () => {
         active = false;
@@ -300,52 +422,610 @@ export default function Index() {
     );
   }
 
+  const now = Date.now();
+  const upcomingCount = studentEvents.filter(
+    (event) => getStudentEventStatus(event, now) === 'Upcoming'
+  ).length;
+  const visibleStudentEvents = showAllEvents
+    ? studentEvents
+    : studentEvents.slice(0, 3);
+
   return (
-    <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.headerContainer}>
-        <Header title="QR Attendance" />
-
-        <View style={styles.welcomeContainer}>
-          <Text style={styles.welcomeText}>Welcome back 👋</Text>
-          <Text style={styles.welcomeSubtext}>
-            Manage your school attendance easily.
-          </Text>
+    <SafeAreaView style={styles.studentScreen}>
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.studentContent}
+      >
+        <View style={styles.studentHeader}>
+          <View style={styles.studentHeaderText}>
+            <Text style={styles.studentTitle}>Student Dashboard</Text>
+            <Text style={styles.studentWelcome}>Welcome back!</Text>
+          </View>
+          <View style={styles.studentHeaderIcon}>
+            <Ionicons
+              name="school-outline"
+              size={23}
+              color={STUDENT_DASHBOARD_COLORS.primary}
+            />
+          </View>
         </View>
-      </View>
 
-      {/* Main Content */}
-      <View style={styles.bodyContainer}>
-        {/* Attendance Card */}
-        <View style={styles.attendanceCard}>
-          <View style={styles.cardHeader}>
-            <View>
-              <Text style={styles.cardLabel}>ATTENDANCE</Text>
-              <Text style={styles.cardTitle}>School Activities</Text>
+        <View style={styles.studentSummaryRow}>
+          <View style={styles.studentSummaryCard}>
+            <View style={styles.studentSummaryIcon}>
+              <Ionicons
+                name="checkmark-done-outline"
+                size={18}
+                color={STUDENT_DASHBOARD_COLORS.primary}
+              />
             </View>
-
-            <View style={styles.statusBadge}>
-              <Text style={styles.statusText}>ACTIVE</Text>
-            </View>
+            <Text style={styles.studentSummaryValue}>
+              {studentDashboardLoading ? '—' : studentAttendance.length}
+            </Text>
+            <Text style={styles.studentSummaryLabel}>Events attended</Text>
           </View>
 
-          <View style={styles.cardDivider} />
-
-          <Text style={styles.mainTitle}>Record your attendance</Text>
-
-          <Text style={styles.description}>
-            Scan the QR code provided by your instructor to record your
-            attendance during school activities.
-          </Text>
+          <View style={styles.studentSummaryCard}>
+            <View style={styles.studentSummaryIcon}>
+              <Ionicons
+                name="calendar-outline"
+                size={18}
+                color={STUDENT_DASHBOARD_COLORS.primary}
+              />
+            </View>
+            <Text style={styles.studentSummaryValue}>
+              {studentDashboardLoading || studentDashboardError
+                ? '—'
+                : upcomingCount}
+            </Text>
+            <Text style={styles.studentSummaryLabel}>Upcoming events</Text>
+          </View>
         </View>
 
-      </View>
+        <View style={styles.studentSection}>
+          <View style={styles.studentSectionHeader}>
+            <Text style={styles.studentSectionTitle}>Upcoming Events</Text>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setShowAllEvents((current) => !current)}
+              style={styles.studentViewAll}
+            >
+              <Text style={styles.studentViewAllText}>
+                {showAllEvents ? 'Show less' : 'View all'}
+              </Text>
+              <Ionicons
+                name={showAllEvents ? 'chevron-up' : 'chevron-forward'}
+                size={15}
+                color={STUDENT_DASHBOARD_COLORS.primary}
+              />
+            </Pressable>
+          </View>
 
+          {studentDashboardLoading ? (
+            <View style={styles.studentEmptyState}>
+              <ActivityIndicator color={STUDENT_DASHBOARD_COLORS.primary} />
+              <Text style={styles.studentEmptyText}>Loading events...</Text>
+            </View>
+          ) : studentDashboardError ? (
+            <View style={styles.studentEmptyState}>
+              <Text style={styles.studentEmptyText}>
+                Upcoming events are unavailable right now.
+              </Text>
+            </View>
+          ) : studentEvents.length === 0 ? (
+            <View style={styles.studentEmptyState}>
+              <Ionicons
+                name="calendar-clear-outline"
+                size={23}
+                color={STUDENT_DASHBOARD_COLORS.secondaryText}
+              />
+              <Text style={styles.studentEmptyText}>No upcoming events</Text>
+            </View>
+          ) : (
+            visibleStudentEvents.map((event) => {
+              const status = getStudentEventStatus(event, now);
+
+              return (
+                <View key={event.id} style={styles.studentEventCard}>
+                  <View style={styles.studentEventHeader}>
+                    <Text style={styles.studentEventTitle} numberOfLines={2}>
+                      {event.title}
+                    </Text>
+                    <View
+                      style={[
+                        styles.studentStatusBadge,
+                        status === 'Ongoing'
+                          ? styles.studentOngoingBadge
+                          : styles.studentUpcomingBadge,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.studentStatusText,
+                          status === 'Ongoing'
+                            ? styles.studentOngoingText
+                            : styles.studentUpcomingText,
+                        ]}
+                      >
+                        {status}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={styles.studentEventTimeRow}>
+                    <Ionicons
+                      name="time-outline"
+                      size={15}
+                      color={STUDENT_DASHBOARD_COLORS.secondaryText}
+                    />
+                    <Text style={styles.studentEventTime} numberOfLines={1}>
+                      Starts {formatStudentEventTime(event.start_time)}
+                    </Text>
+                  </View>
+                  <View style={styles.studentEventTimeRow}>
+                    <Ionicons
+                      name="time-outline"
+                      size={15}
+                      color={STUDENT_DASHBOARD_COLORS.secondaryText}
+                    />
+                    <Text style={styles.studentEventTime} numberOfLines={1}>
+                      Ends {formatStudentEventTime(event.end_time)}
+                    </Text>
+                  </View>
+
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => setSelectedStudentEvent(event)}
+                    style={styles.studentDetailsButton}
+                  >
+                    <Text style={styles.studentDetailsText}>
+                      View Event Details
+                    </Text>
+                    <Ionicons
+                      name="arrow-forward"
+                      size={16}
+                      color={STUDENT_DASHBOARD_COLORS.primary}
+                    />
+                  </Pressable>
+                </View>
+              );
+            })
+          )}
+        </View>
+
+        <View style={styles.studentSection}>
+          <View style={styles.studentSectionHeader}>
+            <Text style={styles.studentSectionTitle}>My Recent Attendance</Text>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => router.push('/history')}
+              style={styles.studentViewAll}
+            >
+              <Text style={styles.studentViewAllText}>View all</Text>
+              <Ionicons
+                name="chevron-forward"
+                size={15}
+                color={STUDENT_DASHBOARD_COLORS.primary}
+              />
+            </Pressable>
+          </View>
+
+          {studentDashboardLoading ? (
+            <View style={styles.studentEmptyState}>
+              <ActivityIndicator color={STUDENT_DASHBOARD_COLORS.primary} />
+              <Text style={styles.studentEmptyText}>Loading attendance...</Text>
+            </View>
+          ) : studentAttendance.length === 0 ? (
+            <View style={styles.studentEmptyState}>
+              <Ionicons
+                name="receipt-outline"
+                size={23}
+                color={STUDENT_DASHBOARD_COLORS.secondaryText}
+              />
+              <Text style={styles.studentEmptyText}>
+                No attendance records yet
+              </Text>
+            </View>
+          ) : (
+            studentAttendance.slice(0, 3).map((record) => (
+              <View key={record.id} style={styles.studentAttendanceRow}>
+                <View style={styles.studentAttendanceIcon}>
+                  <Ionicons
+                    name="checkmark"
+                    size={17}
+                    color={STUDENT_DASHBOARD_COLORS.success}
+                  />
+                </View>
+                <View style={styles.studentAttendanceText}>
+                  <Text style={styles.studentAttendanceTitle} numberOfLines={1}>
+                    {record.eventTitle}
+                  </Text>
+                  <Text style={styles.studentAttendanceDate}>
+                    {formatStudentEventTime(record.scannedAt)}
+                  </Text>
+                </View>
+              </View>
+            ))
+          )}
+        </View>
+      </ScrollView>
+
+      <Modal
+        visible={selectedStudentEvent !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSelectedStudentEvent(null)}
+      >
+        <View style={styles.studentModalOverlay}>
+          <View style={styles.studentModalCard}>
+            <View style={styles.studentModalHeader}>
+              <Text style={styles.studentModalTitle} numberOfLines={2}>
+                {selectedStudentEvent?.title}
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Close event details"
+                onPress={() => setSelectedStudentEvent(null)}
+                style={styles.studentModalClose}
+              >
+                <Ionicons
+                  name="close"
+                  size={20}
+                  color={STUDENT_DASHBOARD_COLORS.secondaryText}
+                />
+              </Pressable>
+            </View>
+            {selectedStudentEvent && (
+              <>
+                <View
+                  style={[
+                    styles.studentStatusBadge,
+                    getStudentEventStatus(selectedStudentEvent) === 'Ongoing'
+                      ? styles.studentOngoingBadge
+                      : styles.studentUpcomingBadge,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.studentStatusText,
+                      getStudentEventStatus(selectedStudentEvent) === 'Ongoing'
+                        ? styles.studentOngoingText
+                        : styles.studentUpcomingText,
+                    ]}
+                  >
+                    {getStudentEventStatus(selectedStudentEvent)}
+                  </Text>
+                </View>
+                <Text style={styles.studentModalLabel}>STARTS</Text>
+                <Text style={styles.studentModalValue}>
+                  {formatStudentEventTime(selectedStudentEvent.start_time)}
+                </Text>
+                <Text style={styles.studentModalLabel}>ENDS</Text>
+                <Text style={styles.studentModalValue}>
+                  {formatStudentEventTime(selectedStudentEvent.end_time)}
+                </Text>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  studentScreen: {
+    flex: 1,
+    backgroundColor: STUDENT_DASHBOARD_COLORS.background,
+  },
+
+  studentContent: {
+    width: '100%',
+    maxWidth: 760,
+    alignSelf: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 30,
+  },
+
+  studentHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 22,
+  },
+
+  studentHeaderText: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  studentTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.text,
+    marginBottom: 5,
+  },
+
+  studentWelcome: {
+    fontSize: 14,
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+  },
+
+  studentHeaderIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: STUDENT_DASHBOARD_COLORS.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 12,
+  },
+
+  studentSummaryRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 25,
+  },
+
+  studentSummaryCard: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 122,
+    backgroundColor: STUDENT_DASHBOARD_COLORS.card,
+    borderWidth: 1,
+    borderColor: STUDENT_DASHBOARD_COLORS.border,
+    borderRadius: 14,
+    padding: 13,
+  },
+
+  studentSummaryIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    backgroundColor: STUDENT_DASHBOARD_COLORS.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+
+  studentSummaryValue: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.text,
+  },
+
+  studentSummaryLabel: {
+    fontSize: 11,
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+    marginTop: 2,
+  },
+
+  studentSection: {
+    marginBottom: 24,
+  },
+
+  studentSectionHeader: {
+    minHeight: 42,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+
+  studentSectionTitle: {
+    flex: 1,
+    fontSize: 17,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.text,
+    marginRight: 8,
+  },
+
+  studentViewAll: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 8,
+  },
+
+  studentViewAllText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.primaryDark,
+    marginRight: 3,
+  },
+
+  studentEmptyState: {
+    minHeight: 76,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: STUDENT_DASHBOARD_COLORS.card,
+    borderWidth: 1,
+    borderColor: STUDENT_DASHBOARD_COLORS.border,
+    borderRadius: 14,
+    padding: 16,
+  },
+
+  studentEmptyText: {
+    fontSize: 13,
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+    marginLeft: 8,
+  },
+
+  studentEventCard: {
+    backgroundColor: STUDENT_DASHBOARD_COLORS.card,
+    borderWidth: 1,
+    borderColor: STUDENT_DASHBOARD_COLORS.border,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+  },
+
+  studentEventHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+  },
+
+  studentEventTitle: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+    lineHeight: 20,
+    color: STUDENT_DASHBOARD_COLORS.text,
+    marginRight: 8,
+  },
+
+  studentStatusBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
+
+  studentUpcomingBadge: {
+    backgroundColor: STUDENT_DASHBOARD_COLORS.primaryLight,
+  },
+
+  studentOngoingBadge: {
+    backgroundColor: COLORS.successLight,
+  },
+
+  studentStatusText: {
+    fontSize: 10,
+    fontWeight: '700',
+  },
+
+  studentUpcomingText: {
+    color: STUDENT_DASHBOARD_COLORS.primaryDark,
+  },
+
+  studentOngoingText: {
+    color: STUDENT_DASHBOARD_COLORS.success,
+  },
+
+  studentEventTimeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+
+  studentEventTime: {
+    flex: 1,
+    fontSize: 12,
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+    marginLeft: 7,
+  },
+
+  studentDetailsButton: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    marginTop: 3,
+    paddingRight: 8,
+  },
+
+  studentDetailsText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.primaryDark,
+    marginRight: 6,
+  },
+
+  studentAttendanceRow: {
+    minHeight: 66,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: STUDENT_DASHBOARD_COLORS.card,
+    borderWidth: 1,
+    borderColor: STUDENT_DASHBOARD_COLORS.border,
+    borderRadius: 13,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 8,
+  },
+
+  studentAttendanceIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 11,
+    backgroundColor: COLORS.successLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+
+  studentAttendanceText: {
+    flex: 1,
+    minWidth: 0,
+  },
+
+  studentAttendanceTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: STUDENT_DASHBOARD_COLORS.text,
+    marginBottom: 4,
+  },
+
+  studentAttendanceDate: {
+    fontSize: 11,
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+  },
+
+  studentModalOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: COLORS.background,
+    padding: 20,
+  },
+
+  studentModalCard: {
+    width: '100%',
+    maxWidth: 440,
+    backgroundColor: STUDENT_DASHBOARD_COLORS.card,
+    borderRadius: 18,
+    padding: 20,
+  },
+
+  studentModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 15,
+  },
+
+  studentModalTitle: {
+    flex: 1,
+    fontSize: 18,
+    fontWeight: '700',
+    lineHeight: 24,
+    color: STUDENT_DASHBOARD_COLORS.text,
+    marginRight: 8,
+  },
+
+  studentModalClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: STUDENT_DASHBOARD_COLORS.background,
+  },
+
+  studentModalLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: STUDENT_DASHBOARD_COLORS.secondaryText,
+    marginTop: 17,
+    marginBottom: 4,
+  },
+
+  studentModalValue: {
+    fontSize: 14,
+    color: STUDENT_DASHBOARD_COLORS.text,
+  },
+
   teacherContent: {
     paddingHorizontal: 22,
     paddingTop: 22,
