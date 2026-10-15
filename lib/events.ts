@@ -17,6 +17,11 @@ export type CloudEvent = {
   created_at: string;
 };
 
+export type AvailableEvent = Pick<
+  CloudEvent,
+  'id' | 'event_code' | 'title' | 'start_time' | 'end_time'
+>;
+
 export async function createEvent(
   event: Event
 ): Promise<{ error: string | null }> {
@@ -58,6 +63,19 @@ export async function getEventsByTeacher(
   }
 
   return data as CloudEvent[];
+}
+
+export async function getAvailableEvents(): Promise<AvailableEvent[]> {
+  const { data, error } = await supabase
+    .from('events')
+    .select('id, event_code, title, start_time, end_time')
+    .order('start_time', { ascending: true, nullsFirst: false });
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []) as AvailableEvent[];
 }
 
 export async function getEventByCode(

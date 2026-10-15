@@ -141,6 +141,23 @@ export default function TabLayout() {
         }}
       />
 
+      {/* STUDENT AVAILABLE EVENTS */}
+      <Tabs.Screen
+        name="available-events"
+        options={{
+          title: 'Available Events',
+          tabBarLabel: 'Events',
+          href: isStudent ? undefined : null,
+          tabBarIcon: ({ color, focused }) => (
+            <Ionicons
+              name={focused ? 'calendar' : 'calendar-outline'}
+              color={color}
+              size={24}
+            />
+          ),
+        }}
+      />
+
       {/* TEACHER EVENT MANAGEMENT */}
       <Tabs.Screen
         name="teacher"
