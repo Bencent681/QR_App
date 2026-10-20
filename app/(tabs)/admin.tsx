@@ -9,6 +9,7 @@ import {
   Alert,
   ActivityIndicator,
   Modal,
+  Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -17,6 +18,9 @@ import {
   View,
   Pressable,
 } from 'react-native';
+import DateTimePicker, {
+  DateTimePickerEvent,
+} from '@react-native-community/datetimepicker';
 import { Redirect } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 
@@ -129,6 +133,69 @@ function formatTime(value: string) {
   });
 }
 
+function toLocalISO(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:00`
+  );
+}
+
+function inspectAttendanceRpcResult(result: unknown) {
+  if (result === false) {
+    return {
+      failure: 'The server rejected the attendance change.',
+      message: null,
+    };
+  }
+
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return { failure: null, message: null };
+  }
+
+  const response = result as Record<string, unknown>;
+  const hasError =
+    response.error !== undefined &&
+    response.error !== null &&
+    response.error !== false &&
+    response.error !== '';
+  const error =
+    typeof response.error === 'string'
+      ? response.error.trim()
+      : response.error &&
+          typeof response.error === 'object' &&
+          'message' in response.error &&
+          typeof response.error.message === 'string'
+        ? response.error.message.trim()
+        : '';
+  const message =
+    typeof response.message === 'string' ? response.message.trim() : '';
+  const status =
+    typeof response.status === 'string'
+      ? response.status.trim().toLowerCase()
+      : '';
+  const rejected =
+    response.success === false ||
+    response.ok === false ||
+    status === 'error' ||
+    status === 'failed' ||
+    status === 'failure' ||
+    status === 'rejected';
+
+  return {
+    failure:
+      error ||
+      (hasError
+        ? message || 'The server reported an attendance change error.'
+        : null) ||
+      (rejected
+        ? message || 'The server rejected the attendance change.'
+        : null),
+    message: !hasError && !rejected ? message || null : null,
+  };
+}
+
 export default function AdminScreen() {
   const { user } = useAuth();
 
@@ -158,17 +225,21 @@ export default function AdminScreen() {
   const [deleteState, setDeleteState] = useState<DeleteModalState | null>(null);
   const correctionSubmittingRef = useRef(false);
   const deletionConfirmingRef = useRef(false);
+  const [attendancePickerVisible, setAttendancePickerVisible] = useState(false);
+  const [attendancePickerDate, setAttendancePickerDate] = useState(new Date());
+  const [attendanceAndroidPickerMode, setAttendanceAndroidPickerMode] =
+    useState<'date' | 'time'>('date');
 
   const [eventsLoading, setEventsLoading] = useState(false);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [attendanceError, setAttendanceError] = useState<string | null>(null);
 
   const [eventSearch, setEventSearch] = useState('');
-const [eventFilter, setEventFilter] = useState<EventFilter>('All');
-const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [eventFilter, setEventFilter] = useState<EventFilter>('All');
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
 
-const [attendanceView, setAttendanceView] = useState(false);
-const [attendanceSearch, setAttendanceSearch] = useState('');
+  const [attendanceView, setAttendanceView] = useState(true);
+  const [attendanceSearch, setAttendanceSearch] = useState('');
 
 
   // Load the signed-in user's role.
@@ -323,6 +394,9 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
       setEventsError(
         'Unable to load events. Check your Supabase events-table permissions and try again.'
       );
+      setAttendanceError(
+        'Unable to load attendance records and related profiles because event data could not be loaded.'
+      );
     } finally {
       setEventsLoading(false);
     }
@@ -392,6 +466,108 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
     [events]
   );
 
+  const openAttendanceCorrection = useCallback(
+    (record: AttendanceRecord) => {
+      const student = studentById.get(record.student_id);
+      const event = eventById.get(record.event_id);
+      setAttendancePickerVisible(false);
+
+      setCorrectionState({
+        record,
+        studentName:
+          student?.full_name?.trim() || 'Student name unavailable',
+        eventTitle: event?.title || 'Event unavailable',
+        newScannedAt: record.scanned_at,
+        reason: '',
+        error: null,
+        submitting: false,
+      });
+    },
+    [studentById, eventById]
+  );
+
+  const openAttendanceDeletion = useCallback((record: AttendanceRecord) => {
+    setDeleteState({
+      record,
+      reason: '',
+      error: null,
+      submitting: false,
+    });
+  }, []);
+
+  const openAttendanceDatePicker = useCallback(() => {
+    if (!correctionState) return;
+
+    const parsedDate = new Date(correctionState.newScannedAt);
+    setAttendancePickerDate(
+      Number.isNaN(parsedDate.getTime()) ? new Date() : parsedDate
+    );
+    setAttendanceAndroidPickerMode('date');
+    setAttendancePickerVisible(true);
+  }, [correctionState]);
+
+  const handleAndroidAttendancePickerChange = useCallback(
+    (event: DateTimePickerEvent, selectedDate?: Date) => {
+      if (event.type === 'dismissed') {
+        setAttendancePickerVisible(false);
+        setAttendanceAndroidPickerMode('date');
+        return;
+      }
+
+      if (!selectedDate) return;
+
+      if (attendanceAndroidPickerMode === 'date') {
+        const newDate = new Date(selectedDate);
+        newDate.setHours(attendancePickerDate.getHours());
+        newDate.setMinutes(attendancePickerDate.getMinutes());
+        newDate.setSeconds(0);
+        newDate.setMilliseconds(0);
+        setAttendancePickerDate(newDate);
+        setAttendanceAndroidPickerMode('time');
+        return;
+      }
+
+      const finalDate = new Date(attendancePickerDate);
+      finalDate.setHours(selectedDate.getHours());
+      finalDate.setMinutes(selectedDate.getMinutes());
+      finalDate.setSeconds(0);
+      finalDate.setMilliseconds(0);
+      setAttendancePickerDate(finalDate);
+      setCorrectionState((current) =>
+        current
+          ? {
+              ...current,
+              newScannedAt: toLocalISO(finalDate),
+              error: null,
+            }
+          : current
+      );
+      setAttendancePickerVisible(false);
+      setAttendanceAndroidPickerMode('date');
+    },
+    [attendanceAndroidPickerMode, attendancePickerDate]
+  );
+
+  const handleIOSAttendancePickerChange = useCallback(
+    (_event: DateTimePickerEvent, selectedDate?: Date) => {
+      if (selectedDate) setAttendancePickerDate(selectedDate);
+    },
+    []
+  );
+
+  const confirmIOSAttendancePicker = useCallback(() => {
+    setCorrectionState((current) =>
+      current
+        ? {
+            ...current,
+            newScannedAt: toLocalISO(attendancePickerDate),
+            error: null,
+          }
+        : current
+    );
+    setAttendancePickerVisible(false);
+  }, [attendancePickerDate]);
+
   const submitAttendanceCorrection = useCallback(async () => {
     if (!correctionState || correctionSubmittingRef.current) return;
 
@@ -423,36 +599,70 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
     );
     correctionSubmittingRef.current = true;
 
-    try {
-      const { error } = await supabase.rpc('admin_correct_attendance', {
-        p_attendance_id: correctionState.record.id,
-        p_new_scanned_at: parsedTimestamp.toISOString(),
-        p_reason: reason,
-      });
+    Alert.alert(
+      'Confirm attendance correction',
+      `Correct ${correctionState.studentName}'s attendance for ${correctionState.eventTitle} to ${formatDateTime(
+        parsedTimestamp.toISOString()
+      )}? This change will be recorded in the audit history.`,
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+          onPress: () => {
+            correctionSubmittingRef.current = false;
+            setCorrectionState((current) =>
+              current ? { ...current, submitting: false } : current
+            );
+          },
+        },
+        {
+          text: 'Confirm',
+          onPress: () => {
+            void (async () => {
+              try {
+                const { data, error } = await supabase.rpc(
+                  'admin_correct_attendance',
+                  {
+                    p_attendance_id: correctionState.record.id,
+                    p_new_scanned_at: parsedTimestamp.toISOString(),
+                    p_reason: reason,
+                  }
+                );
 
-      if (error) throw error;
+                if (error) throw error;
+                const result = inspectAttendanceRpcResult(data);
+                if (result.failure) throw new Error(result.failure);
 
-      correctionSubmittingRef.current = false;
-      setCorrectionState(null);
-      await refreshAttendanceData();
-      Alert.alert('Attendance corrected', 'The attendance record was updated.');
-    } catch (error) {
-      console.error('CORRECT ATTENDANCE ERROR:', error);
-      setCorrectionState((current) =>
-        current
-          ? {
-              ...current,
-              submitting: false,
-              error:
-                error instanceof Error
-                  ? `Unable to correct attendance: ${error.message}`
-                  : 'Unable to correct attendance. Please try again.',
-            }
-          : current
-      );
-    } finally {
-      correctionSubmittingRef.current = false;
-    }
+                setCorrectionState(null);
+                setAttendancePickerVisible(false);
+                await refreshAttendanceData();
+                Alert.alert(
+                  'Attendance corrected',
+                  result.message || 'The attendance record was updated.'
+                );
+              } catch (error) {
+                console.error('CORRECT ATTENDANCE ERROR:', error);
+                setCorrectionState((current) =>
+                  current
+                    ? {
+                        ...current,
+                        submitting: false,
+                        error:
+                          error instanceof Error
+                            ? `Unable to correct attendance: ${error.message}`
+                            : 'Unable to correct attendance. Please try again.',
+                      }
+                    : current
+                );
+              } finally {
+                correctionSubmittingRef.current = false;
+              }
+            })();
+          },
+        },
+      ],
+      { cancelable: false }
+    );
   }, [correctionState, refreshAttendanceData]);
 
   const submitAttendanceDeletion = useCallback(
@@ -462,17 +672,25 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
       );
 
       try {
-        const { error } = await supabase.rpc('admin_delete_attendance', {
-          p_attendance_id: record.id,
-          p_reason: reason,
-        });
+        const { data, error } = await supabase.rpc(
+          'admin_delete_attendance',
+          {
+            p_attendance_id: record.id,
+            p_reason: reason,
+          }
+        );
 
         if (error) throw error;
+        const result = inspectAttendanceRpcResult(data);
+        if (result.failure) throw new Error(result.failure);
 
         deletionConfirmingRef.current = false;
         setDeleteState(null);
         await refreshAttendanceData();
-        Alert.alert('Attendance deleted', 'The attendance record was removed.');
+        Alert.alert(
+          'Attendance deleted',
+          result.message || 'The attendance record was removed.'
+        );
       } catch (error) {
         console.error('DELETE ATTENDANCE ERROR:', error);
         setDeleteState((current) =>
@@ -610,6 +828,32 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
           new Date(b.scanned_at).getTime()
       );
   }, [attendance, selectedEventId]);
+
+  const filteredAttendance = useMemo(() => {
+    const term = attendanceSearch.trim().toLowerCase();
+
+    return attendance
+      .filter((record) => {
+        const student = studentById.get(record.student_id);
+        const event = eventById.get(record.event_id);
+
+        return (
+          !term ||
+          (student?.full_name ?? '').toLowerCase().includes(term) ||
+          (student?.student_id ?? '').toLowerCase().includes(term) ||
+          (student?.short_id ?? '').toLowerCase().includes(term) ||
+          (student?.email ?? '').toLowerCase().includes(term) ||
+          (event?.title ?? '').toLowerCase().includes(term) ||
+          record.scanned_at.toLowerCase().includes(term) ||
+          formatDateTime(record.scanned_at).toLowerCase().includes(term)
+        );
+      })
+      .sort(
+        (left, right) =>
+          new Date(right.scanned_at).getTime() -
+          new Date(left.scanned_at).getTime()
+      );
+  }, [attendance, attendanceSearch, studentById, eventById]);
 
   // Require login.
   if (!user) {
@@ -1019,6 +1263,187 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
           />
         </View>
 
+        {/* Searchable attendance management */}
+        <View style={styles.sectionHeadingRow}>
+          <View style={styles.headingTextContainer}>
+            <Text style={styles.sectionTitleNoMargin}>
+              Attendance Management
+            </Text>
+            <Text style={styles.directorySubtitle}>
+              Search, correct, or remove recorded attendance.
+            </Text>
+          </View>
+          <Pressable
+            onPress={() => setAttendanceView((visible) => !visible)}
+            style={styles.refreshButton}
+            accessibilityRole="button"
+            accessibilityLabel={
+              attendanceView
+                ? 'Hide attendance management'
+                : 'Show attendance management'
+            }
+          >
+            <Ionicons
+              name={attendanceView ? 'chevron-up' : 'chevron-down'}
+              size={20}
+              color={COLORS.primary}
+            />
+          </Pressable>
+          <Pressable
+            onPress={loadEventDashboard}
+            disabled={eventsLoading}
+            style={({ pressed }) => [
+              styles.refreshButton,
+              pressed && styles.pressed,
+              eventsLoading && styles.disabledButton,
+            ]}
+            accessibilityLabel="Refresh attendance records"
+          >
+            <Ionicons
+              name="refresh-outline"
+              size={20}
+              color={COLORS.primary}
+            />
+          </Pressable>
+        </View>
+
+        {attendanceView ? (
+          <>
+            <View style={styles.searchBox}>
+              <Ionicons
+                name="search-outline"
+                size={20}
+                color={COLORS.textSecondary}
+              />
+              <TextInput
+                style={styles.searchInput}
+                value={attendanceSearch}
+                onChangeText={setAttendanceSearch}
+                placeholder="Search student, ID, event, or timestamp"
+                placeholderTextColor={COLORS.textSecondary}
+                autoCapitalize="none"
+                autoCorrect={false}
+                returnKeyType="search"
+                accessibilityLabel="Search attendance records"
+              />
+              {attendanceSearch.length > 0 ? (
+                <Pressable
+                  onPress={() => setAttendanceSearch('')}
+                  accessibilityLabel="Clear attendance search"
+                >
+                  <Ionicons
+                    name="close-circle"
+                    size={20}
+                    color={COLORS.textSecondary}
+                  />
+                </Pressable>
+              ) : null}
+            </View>
+
+            {eventsLoading ? (
+              <View style={styles.directoryMessage}>
+                <ActivityIndicator size="small" color={COLORS.primary} />
+                <Text style={styles.loadingText}>
+                  Loading attendance records...
+                </Text>
+              </View>
+            ) : attendanceError ? (
+              <EmptyState
+                icon="alert-circle-outline"
+                title="Could not load attendance"
+                message={attendanceError}
+                actionLabel="Try Again"
+                onAction={loadEventDashboard}
+              />
+            ) : attendance.length === 0 ? (
+              <EmptyState
+                icon="checkmark-circle-outline"
+                title="No attendance records yet"
+                message="Student check-ins will appear here."
+              />
+            ) : filteredAttendance.length === 0 ? (
+              <EmptyState
+                icon="search-outline"
+                title="No matching attendance"
+                message="Try another student, identifier, event, or timestamp."
+              />
+            ) : (
+              <>
+                <Text style={styles.resultCount}>
+                  {filteredAttendance.length}{' '}
+                  {filteredAttendance.length === 1
+                    ? 'attendance record'
+                    : 'attendance records'}
+                </Text>
+                {filteredAttendance.map((record) => {
+                  const student = studentById.get(record.student_id);
+                  const event = eventById.get(record.event_id);
+
+                  return (
+                    <View
+                      key={record.id}
+                      style={styles.attendanceManagementCard}
+                    >
+                      <View style={styles.attendanceManagementInfo}>
+                        <Text style={styles.attendeeName}>
+                          {student?.full_name?.trim() ||
+                            'Student name unavailable'}
+                        </Text>
+                        {student?.short_id ? (
+                          <Text style={styles.attendeeStudentId}>
+                            Short ID: {student.short_id}
+                          </Text>
+                        ) : null}
+                        {student?.student_id ? (
+                          <Text style={styles.attendeeStudentId}>
+                            School ID: {student.student_id}
+                          </Text>
+                        ) : null}
+                        {!student?.short_id && !student?.student_id ? (
+                          <Text style={styles.attendeeStudentId}>
+                            Student identifier unavailable
+                          </Text>
+                        ) : null}
+                        <Text style={styles.attendanceManagementEvent}>
+                          Event: {event?.title || 'Event unavailable'}
+                        </Text>
+                        <Text style={styles.attendanceManagementTimestamp}>
+                          {formatDateTime(record.scanned_at)}
+                        </Text>
+                      </View>
+                      <View style={styles.attendeeActions}>
+                        <Pressable
+                          style={styles.attendeeActionButton}
+                          onPress={() => openAttendanceCorrection(record)}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Correct attendance for ${
+                            student?.full_name || 'student'
+                          } at ${event?.title || 'event'}`}
+                        >
+                          <Text style={styles.correctActionText}>Correct</Text>
+                        </Pressable>
+                        <Pressable
+                          style={[
+                            styles.attendeeActionButton,
+                            styles.deleteActionButton,
+                          ]}
+                          onPress={() => openAttendanceDeletion(record)}
+                          accessibilityRole="button"
+                          accessibilityLabel={`Delete attendance for ${
+                            student?.full_name || 'student'
+                          } at ${event?.title || 'event'}`}
+                        >
+                          <Text style={styles.deleteActionText}>Delete</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })}
+              </>
+            )}
+          </>
+        ) : null}
+
         {/* Event monitoring */}
         <View style={styles.sectionHeadingRow}>
           <View style={styles.headingTextContainer}>
@@ -1335,17 +1760,7 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                                 <Pressable
                                   style={styles.attendeeActionButton}
                                   onPress={() =>
-                                    setCorrectionState({
-                                      record,
-                                      studentName:
-                                        student?.full_name?.trim() ||
-                                        'Student name unavailable',
-                                      eventTitle: event.title,
-                                      newScannedAt: record.scanned_at,
-                                      reason: '',
-                                      error: null,
-                                      submitting: false,
-                                    })
+                                    openAttendanceCorrection(record)
                                   }
                                   accessibilityRole="button"
                                   accessibilityLabel={`Correct attendance for ${
@@ -1362,12 +1777,7 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                                     styles.deleteActionButton,
                                   ]}
                                   onPress={() =>
-                                    setDeleteState({
-                                      record,
-                                      reason: '',
-                                      error: null,
-                                      submitting: false,
-                                    })
+                                    openAttendanceDeletion(record)
                                   }
                                   accessibilityRole="button"
                                   accessibilityLabel={`Delete attendance for ${
@@ -1444,12 +1854,30 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
           auditHistory.map((audit) => {
             const student = studentById.get(audit.student_id);
             const auditedEvent = eventById.get(audit.event_id);
+            const administrator = studentById.get(audit.admin_id);
+            const normalizedAction = audit.action.toLowerCase();
+            const isCorrection = normalizedAction.includes('correct');
+            const isDeletion = normalizedAction.includes('delete');
+            const actionLabel = isCorrection
+              ? 'Attendance corrected'
+              : isDeletion
+                ? 'Attendance deleted'
+                : audit.action.replace(/_/g, ' ');
 
             return (
               <View key={audit.id} style={styles.auditCard}>
                 <View style={styles.auditHeader}>
-                  <Text style={styles.auditAction}>
-                    {audit.action.replace(/_/g, ' ')}
+                  <Text
+                    style={[
+                      styles.auditAction,
+                      isDeletion
+                        ? styles.auditDeleted
+                        : isCorrection
+                          ? styles.auditCorrected
+                          : null,
+                    ]}
+                  >
+                    {actionLabel}
                   </Text>
                   <Text style={styles.auditDate}>
                     {formatDateTime(audit.created_at)}
@@ -1462,7 +1890,7 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                   Event: {auditedEvent?.title || 'Unavailable'}
                 </Text>
                 <Text style={styles.auditDetail}>
-                  Original timestamp:{' '}
+                  Previous timestamp:{' '}
                   {audit.old_scanned_at
                     ? formatDateTime(audit.old_scanned_at)
                     : 'Not available'}
@@ -1473,7 +1901,11 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                   </Text>
                 ) : null}
                 <Text style={styles.auditDetail}>
-                  Administrator ID: {audit.admin_id || 'Not available'}
+                  Administrator:{' '}
+                  {administrator?.full_name?.trim() ||
+                    administrator?.email ||
+                    audit.admin_id ||
+                    'Unavailable'}
                 </Text>
                 <Text style={styles.auditReason}>
                   Reason: {audit.reason || 'Not provided'}
@@ -1489,7 +1921,10 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
         transparent
         animationType="fade"
         onRequestClose={() => {
-          if (!correctionState?.submitting) setCorrectionState(null);
+          if (!correctionState?.submitting) {
+            setAttendancePickerVisible(false);
+            setCorrectionState(null);
+          }
         }}
       >
         <View style={styles.modalBackdrop}>
@@ -1524,6 +1959,51 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                   autoCorrect={false}
                   editable={!correctionState.submitting}
                 />
+                {Platform.OS !== 'web' ? (
+                  <Pressable
+                    style={styles.datePickerButton}
+                    onPress={openAttendanceDatePicker}
+                    disabled={correctionState.submitting}
+                    accessibilityRole="button"
+                    accessibilityLabel="Choose attendance date and time"
+                  >
+                    <Ionicons
+                      name="calendar-outline"
+                      size={18}
+                      color={COLORS.primary}
+                    />
+                    <Text style={styles.datePickerButtonText}>
+                      Choose date and time
+                    </Text>
+                  </Pressable>
+                ) : null}
+                {Platform.OS === 'ios' && attendancePickerVisible ? (
+                  <View style={styles.iosPickerContainer}>
+                    <DateTimePicker
+                      value={attendancePickerDate}
+                      mode="datetime"
+                      display="compact"
+                      onChange={handleIOSAttendancePickerChange}
+                      textColor={COLORS.textPrimary}
+                    />
+                    <View style={styles.modalActions}>
+                      <Pressable
+                        style={styles.modalSecondaryButton}
+                        onPress={() => setAttendancePickerVisible(false)}
+                      >
+                        <Text style={styles.modalSecondaryButtonText}>
+                          Cancel
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.modalPrimaryButton}
+                        onPress={confirmIOSAttendancePicker}
+                      >
+                        <Text style={styles.modalPrimaryButtonText}>Done</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : null}
                 <Text style={styles.modalLabel}>Reason (required)</Text>
                 <TextInput
                   style={[styles.modalInput, styles.modalMultilineInput]}
@@ -1547,7 +2027,10 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                 <View style={styles.modalActions}>
                   <Pressable
                     style={styles.modalSecondaryButton}
-                    onPress={() => setCorrectionState(null)}
+                    onPress={() => {
+                      setAttendancePickerVisible(false);
+                      setCorrectionState(null);
+                    }}
                     disabled={correctionState.submitting}
                   >
                     <Text style={styles.modalSecondaryButtonText}>Cancel</Text>
@@ -1574,6 +2057,17 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
           </View>
         </View>
       </Modal>
+
+      {Platform.OS === 'android' &&
+      correctionState !== null &&
+      attendancePickerVisible ? (
+        <DateTimePicker
+          value={attendancePickerDate}
+          mode={attendanceAndroidPickerMode}
+          display="default"
+          onChange={handleAndroidAttendancePickerChange}
+        />
+      ) : null}
 
       <Modal
         visible={deleteState !== null}
@@ -1657,7 +2151,13 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                       );
                       Alert.alert(
                         'Confirm attendance deletion',
-                        'This will permanently remove the attendance record. Continue?',
+                        `Delete attendance for ${
+                          studentById.get(deleteState.record.student_id)
+                            ?.full_name?.trim() || 'this student'
+                        } at ${
+                          eventById.get(deleteState.record.event_id)?.title ||
+                          'this event'
+                        }? This permanently removes the attendance record.`,
                         [
                           {
                             text: 'Cancel',
@@ -2266,6 +2766,32 @@ const styles = StyleSheet.create({
     fontSize: 9,
     marginTop: 2,
   },
+  attendanceManagementCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 22,
+    marginBottom: 10,
+    padding: 13,
+    backgroundColor: COLORS.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  attendanceManagementInfo: {
+    flex: 1,
+    marginRight: 8,
+  },
+  attendanceManagementEvent: {
+    color: COLORS.textPrimary,
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 7,
+  },
+  attendanceManagementTimestamp: {
+    color: COLORS.textSecondary,
+    fontSize: 10,
+    marginTop: 4,
+  },
   attendeeActions: {
     marginLeft: 8,
     gap: 5,
@@ -2313,6 +2839,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '800',
     textTransform: 'capitalize',
+  },
+  auditCorrected: {
+    color: '#15803D',
+  },
+  auditDeleted: {
+    color: COLORS.danger,
   },
   auditDate: {
     color: COLORS.textSecondary,
@@ -2379,6 +2911,26 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
     fontSize: 13,
+  },
+  datePickerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 7,
+    marginTop: 8,
+    marginBottom: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 9,
+    backgroundColor: COLORS.primaryLight,
+  },
+  datePickerButtonText: {
+    color: COLORS.primaryDark,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  iosPickerContainer: {
+    marginBottom: 10,
   },
   modalMultilineInput: {
     minHeight: 82,
