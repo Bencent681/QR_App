@@ -2,10 +2,13 @@ import React, {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import {
+  Alert,
   ActivityIndicator,
+  Modal,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -54,6 +57,36 @@ type AttendanceRecord = {
   event_id: string;
   student_id: string;
   scanned_at: string;
+};
+
+type AttendanceAuditRecord = {
+  id: string;
+  attendance_id: string;
+  student_id: string;
+  event_id: string;
+  action: string;
+  old_scanned_at: string | null;
+  new_scanned_at: string | null;
+  admin_id: string;
+  reason: string;
+  created_at: string;
+};
+
+type CorrectionModalState = {
+  record: AttendanceRecord;
+  studentName: string;
+  eventTitle: string;
+  newScannedAt: string;
+  reason: string;
+  error: string | null;
+  submitting: boolean;
+};
+
+type DeleteModalState = {
+  record: AttendanceRecord;
+  reason: string;
+  error: string | null;
+  submitting: boolean;
 };
 
 type EventStatus = 'Upcoming' | 'Ongoing' | 'Completed';
@@ -117,6 +150,14 @@ export default function AdminScreen() {
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [events, setEvents] = useState<SchoolEvent[]>([]);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  const [auditHistory, setAuditHistory] = useState<AttendanceAuditRecord[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [correctionState, setCorrectionState] =
+    useState<CorrectionModalState | null>(null);
+  const [deleteState, setDeleteState] = useState<DeleteModalState | null>(null);
+  const correctionSubmittingRef = useRef(false);
+  const deletionConfirmingRef = useRef(false);
 
   const [eventsLoading, setEventsLoading] = useState(false);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -274,12 +315,49 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
     }
   }, []);
 
+  const loadAttendanceAuditHistory = useCallback(async () => {
+    setAuditLoading(true);
+    setAuditError(null);
+
+    try {
+      const { data, error } = await supabase
+        .from('attendance_audit_log')
+        .select(
+          'id, attendance_id, student_id, event_id, action, old_scanned_at, new_scanned_at, admin_id, reason, created_at'
+        )
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+
+      setAuditHistory((data ?? []) as AttendanceAuditRecord[]);
+    } catch (error) {
+      console.error('LOAD ATTENDANCE AUDIT HISTORY ERROR:', error);
+      setAuditHistory([]);
+      setAuditError(
+        error instanceof Error
+          ? `Unable to load attendance audit history: ${error.message}`
+          : 'Unable to load attendance audit history. Check your Supabase permissions and try again.'
+      );
+    } finally {
+      setAuditLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (role === 'admin') {
       loadStudents();
       loadEventDashboard();
+      loadAttendanceAuditHistory();
     }
-  }, [role, loadStudents, loadEventDashboard]);
+  }, [role, loadStudents, loadEventDashboard, loadAttendanceAuditHistory]);
+
+  const refreshAttendanceData = useCallback(async () => {
+    await Promise.all([
+      loadStudents(),
+      loadEventDashboard(),
+      loadAttendanceAuditHistory(),
+    ]);
+  }, [loadStudents, loadEventDashboard, loadAttendanceAuditHistory]);
 
   // Create quick lookups by Supabase profile ID.
   const teacherById = useMemo(() => {
@@ -296,6 +374,112 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
     return profileMap;
   }, [students, attendeeProfiles]);
 
+  const eventById = useMemo(
+    () => new Map(events.map((event) => [event.id, event])),
+    [events]
+  );
+
+  const submitAttendanceCorrection = useCallback(async () => {
+    if (!correctionState || correctionSubmittingRef.current) return;
+
+    const timestamp = correctionState.newScannedAt.trim();
+    const reason = correctionState.reason.trim();
+    const parsedTimestamp = new Date(timestamp);
+
+    if (!timestamp || Number.isNaN(parsedTimestamp.getTime())) {
+      setCorrectionState((current) =>
+        current
+          ? {
+              ...current,
+              error: 'Enter a valid timestamp, such as 2026-10-20T09:30:00+08:00.',
+            }
+          : current
+      );
+      return;
+    }
+
+    if (!reason) {
+      setCorrectionState((current) =>
+        current ? { ...current, error: 'A reason is required.' } : current
+      );
+      return;
+    }
+
+    setCorrectionState((current) =>
+      current ? { ...current, submitting: true, error: null } : current
+    );
+    correctionSubmittingRef.current = true;
+
+    try {
+      const { error } = await supabase.rpc('admin_correct_attendance', {
+        p_attendance_id: correctionState.record.id,
+        p_new_scanned_at: parsedTimestamp.toISOString(),
+        p_reason: reason,
+      });
+
+      if (error) throw error;
+
+      correctionSubmittingRef.current = false;
+      setCorrectionState(null);
+      await refreshAttendanceData();
+      Alert.alert('Attendance corrected', 'The attendance record was updated.');
+    } catch (error) {
+      console.error('CORRECT ATTENDANCE ERROR:', error);
+      setCorrectionState((current) =>
+        current
+          ? {
+              ...current,
+              submitting: false,
+              error:
+                error instanceof Error
+                  ? `Unable to correct attendance: ${error.message}`
+                  : 'Unable to correct attendance. Please try again.',
+            }
+          : current
+      );
+    } finally {
+      correctionSubmittingRef.current = false;
+    }
+  }, [correctionState, refreshAttendanceData]);
+
+  const submitAttendanceDeletion = useCallback(
+    async (record: AttendanceRecord, reason: string) => {
+      setDeleteState((current) =>
+        current ? { ...current, submitting: true, error: null } : current
+      );
+
+      try {
+        const { error } = await supabase.rpc('admin_delete_attendance', {
+          p_attendance_id: record.id,
+          p_reason: reason,
+        });
+
+        if (error) throw error;
+
+        deletionConfirmingRef.current = false;
+        setDeleteState(null);
+        await refreshAttendanceData();
+        Alert.alert('Attendance deleted', 'The attendance record was removed.');
+      } catch (error) {
+        console.error('DELETE ATTENDANCE ERROR:', error);
+        setDeleteState((current) =>
+          current
+            ? {
+                ...current,
+                submitting: false,
+                error:
+                  error instanceof Error
+                    ? `Unable to delete attendance: ${error.message}`
+                    : 'Unable to delete attendance. Please try again.',
+              }
+            : current
+        );
+      } finally {
+        deletionConfirmingRef.current = false;
+      }
+    },
+    [refreshAttendanceData]
+  );
   // Count unique students for each event.
   const attendanceCountByEvent = useMemo(() => {
     const result = new Map<string, Set<string>>();
@@ -1133,6 +1317,55 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
                                   ).toLocaleDateString()}
                                 </Text>
                               </View>
+
+                              <View style={styles.attendeeActions}>
+                                <Pressable
+                                  style={styles.attendeeActionButton}
+                                  onPress={() =>
+                                    setCorrectionState({
+                                      record,
+                                      studentName:
+                                        student?.full_name?.trim() ||
+                                        'Student name unavailable',
+                                      eventTitle: event.title,
+                                      newScannedAt: record.scanned_at,
+                                      reason: '',
+                                      error: null,
+                                      submitting: false,
+                                    })
+                                  }
+                                  accessibilityRole="button"
+                                  accessibilityLabel={`Correct attendance for ${
+                                    student?.full_name || 'student'
+                                  }`}
+                                >
+                                  <Text style={styles.correctActionText}>
+                                    Correct
+                                  </Text>
+                                </Pressable>
+                                <Pressable
+                                  style={[
+                                    styles.attendeeActionButton,
+                                    styles.deleteActionButton,
+                                  ]}
+                                  onPress={() =>
+                                    setDeleteState({
+                                      record,
+                                      reason: '',
+                                      error: null,
+                                      submitting: false,
+                                    })
+                                  }
+                                  accessibilityRole="button"
+                                  accessibilityLabel={`Delete attendance for ${
+                                    student?.full_name || 'student'
+                                  }`}
+                                >
+                                  <Text style={styles.deleteActionText}>
+                                    Delete
+                                  </Text>
+                                </Pressable>
+                              </View>
                             </View>
                           );
                         })
@@ -1144,7 +1377,311 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
             })}
           </>
         )}
+
+        {/* Read-only attendance audit history */}
+        <View style={styles.sectionHeadingRow}>
+          <View style={styles.headingTextContainer}>
+            <Text style={styles.sectionTitleNoMargin}>
+              Attendance Audit History
+            </Text>
+            <Text style={styles.directorySubtitle}>
+              Review administrator changes to attendance records.
+            </Text>
+          </View>
+          <Pressable
+            onPress={loadAttendanceAuditHistory}
+            disabled={auditLoading}
+            style={({ pressed }) => [
+              styles.refreshButton,
+              pressed && styles.pressed,
+              auditLoading && styles.disabledButton,
+            ]}
+            accessibilityLabel="Refresh attendance audit history"
+          >
+            <Ionicons
+              name="refresh-outline"
+              size={20}
+              color={COLORS.primary}
+            />
+          </Pressable>
+        </View>
+
+        {auditLoading ? (
+          <View style={styles.directoryMessage}>
+            <ActivityIndicator size="small" color={COLORS.primary} />
+            <Text style={styles.loadingText}>
+              Loading attendance audit history...
+            </Text>
+          </View>
+        ) : auditError ? (
+          <EmptyState
+            icon="alert-circle-outline"
+            title="Could not load audit history"
+            message={auditError}
+            actionLabel="Try Again"
+            onAction={loadAttendanceAuditHistory}
+          />
+        ) : auditHistory.length === 0 ? (
+          <EmptyState
+            icon="document-text-outline"
+            title="No attendance changes yet"
+            message="Corrections and deletions will appear here."
+          />
+        ) : (
+          auditHistory.map((audit) => {
+            const student = studentById.get(audit.student_id);
+            const auditedEvent = eventById.get(audit.event_id);
+
+            return (
+              <View key={audit.id} style={styles.auditCard}>
+                <View style={styles.auditHeader}>
+                  <Text style={styles.auditAction}>
+                    {audit.action.replace(/_/g, ' ')}
+                  </Text>
+                  <Text style={styles.auditDate}>
+                    {formatDateTime(audit.created_at)}
+                  </Text>
+                </View>
+                <Text style={styles.auditDetail}>
+                  Student: {student?.full_name?.trim() || 'Unavailable'}
+                </Text>
+                <Text style={styles.auditDetail}>
+                  Event: {auditedEvent?.title || 'Unavailable'}
+                </Text>
+                <Text style={styles.auditDetail}>
+                  Original timestamp:{' '}
+                  {audit.old_scanned_at
+                    ? formatDateTime(audit.old_scanned_at)
+                    : 'Not available'}
+                </Text>
+                {audit.new_scanned_at ? (
+                  <Text style={styles.auditDetail}>
+                    New timestamp: {formatDateTime(audit.new_scanned_at)}
+                  </Text>
+                ) : null}
+                <Text style={styles.auditDetail}>
+                  Administrator ID: {audit.admin_id || 'Not available'}
+                </Text>
+                <Text style={styles.auditReason}>
+                  Reason: {audit.reason || 'Not provided'}
+                </Text>
+              </View>
+            );
+          })
+        )}
       </ScrollView>
+
+      <Modal
+        visible={correctionState !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!correctionState?.submitting) setCorrectionState(null);
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Correct Attendance</Text>
+            {correctionState ? (
+              <>
+                <Text style={styles.modalContext}>
+                  Student: {correctionState.studentName}
+                </Text>
+                <Text style={styles.modalContext}>
+                  Event: {correctionState.eventTitle}
+                </Text>
+                <Text style={styles.modalContext}>
+                  Current scan: {formatDateTime(correctionState.record.scanned_at)}
+                </Text>
+
+                <Text style={styles.modalLabel}>New timestamp</Text>
+                <TextInput
+                  style={styles.modalInput}
+                  value={correctionState.newScannedAt}
+                  onChangeText={(newScannedAt) =>
+                    setCorrectionState((current) =>
+                      current
+                        ? { ...current, newScannedAt, error: null }
+                        : current
+                    )
+                  }
+                  placeholder="2026-10-20T09:30:00+08:00"
+                  placeholderTextColor={COLORS.textSecondary}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  editable={!correctionState.submitting}
+                />
+                <Text style={styles.modalLabel}>Reason (required)</Text>
+                <TextInput
+                  style={[styles.modalInput, styles.modalMultilineInput]}
+                  value={correctionState.reason}
+                  onChangeText={(reason) =>
+                    setCorrectionState((current) =>
+                      current ? { ...current, reason, error: null } : current
+                    )
+                  }
+                  placeholder="Explain why this attendance is being corrected"
+                  placeholderTextColor={COLORS.textSecondary}
+                  multiline
+                  textAlignVertical="top"
+                  editable={!correctionState.submitting}
+                />
+                {correctionState.error ? (
+                  <Text style={styles.errorText}>
+                    {correctionState.error}
+                  </Text>
+                ) : null}
+                <View style={styles.modalActions}>
+                  <Pressable
+                    style={styles.modalSecondaryButton}
+                    onPress={() => setCorrectionState(null)}
+                    disabled={correctionState.submitting}
+                  >
+                    <Text style={styles.modalSecondaryButtonText}>Cancel</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[
+                      styles.modalPrimaryButton,
+                      correctionState.submitting && styles.disabledButton,
+                    ]}
+                    onPress={submitAttendanceCorrection}
+                    disabled={correctionState.submitting}
+                  >
+                    {correctionState.submitting ? (
+                      <ActivityIndicator size="small" color="#FFFFFF" />
+                    ) : (
+                      <Text style={styles.modalPrimaryButtonText}>
+                        Save correction
+                      </Text>
+                    )}
+                  </Pressable>
+                </View>
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={deleteState !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!deleteState?.submitting) setDeleteState(null);
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Delete Attendance</Text>
+            {deleteState ? (
+              <>
+                <Text style={styles.modalContext}>
+                  Student:{' '}
+                  {studentById.get(deleteState.record.student_id)?.full_name?.trim() ||
+                    'Student name unavailable'}
+                </Text>
+                <Text style={styles.modalContext}>
+                  Event:{' '}
+                  {eventById.get(deleteState.record.event_id)?.title ||
+                    'Event unavailable'}
+                </Text>
+                <Text style={styles.modalWarning}>
+                  This removes the attendance record. Enter a reason before
+                  continuing to the final confirmation.
+                </Text>
+                <Text style={styles.modalLabel}>Reason (required)</Text>
+                <TextInput
+                  style={[styles.modalInput, styles.modalMultilineInput]}
+                  value={deleteState.reason}
+                  onChangeText={(reason) =>
+                    setDeleteState((current) =>
+                      current ? { ...current, reason, error: null } : current
+                    )
+                  }
+                  placeholder="Explain why this attendance is being deleted"
+                  placeholderTextColor={COLORS.textSecondary}
+                  multiline
+                  textAlignVertical="top"
+                  editable={!deleteState.submitting}
+                />
+                {deleteState.error ? (
+                  <Text style={styles.errorText}>{deleteState.error}</Text>
+                ) : null}
+                <View style={styles.modalActions}>
+                  <Pressable
+                    style={styles.modalSecondaryButton}
+                    onPress={() => setDeleteState(null)}
+                    disabled={deleteState.submitting}
+                  >
+                    <Text style={styles.modalSecondaryButtonText}>Cancel</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[
+                      styles.modalDangerButton,
+                      deleteState.submitting && styles.disabledButton,
+                    ]}
+                    disabled={deleteState.submitting}
+                    onPress={() => {
+                      const reason = deleteState.reason.trim();
+                      if (!reason) {
+                        setDeleteState((current) =>
+                          current
+                            ? {
+                                ...current,
+                                error: 'A reason is required.',
+                              }
+                            : current
+                        );
+                        return;
+                      }
+
+                      if (deletionConfirmingRef.current) return;
+                      deletionConfirmingRef.current = true;
+                      setDeleteState((current) =>
+                        current
+                          ? { ...current, submitting: true, error: null }
+                          : current
+                      );
+                      Alert.alert(
+                        'Confirm attendance deletion',
+                        'This will permanently remove the attendance record. Continue?',
+                        [
+                          {
+                            text: 'Cancel',
+                            style: 'cancel',
+                            onPress: () => {
+                              deletionConfirmingRef.current = false;
+                              setDeleteState((current) =>
+                                current
+                                  ? { ...current, submitting: false }
+                                  : current
+                              );
+                            },
+                          },
+                          {
+                            text: 'Delete',
+                            style: 'destructive',
+                            onPress: () =>
+                              void submitAttendanceDeletion(
+                                deleteState.record,
+                                reason
+                              ),
+                          },
+                        ],
+                        { cancelable: false }
+                      );
+                    }}
+                  >
+                    <Text style={styles.modalDangerButtonText}>
+                      Continue
+                    </Text>
+                  </Pressable>
+                </View>
+              </>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1715,6 +2252,168 @@ const styles = StyleSheet.create({
     color: COLORS.textSecondary,
     fontSize: 9,
     marginTop: 2,
+  },
+  attendeeActions: {
+    marginLeft: 8,
+    gap: 5,
+  },
+  attendeeActionButton: {
+    minWidth: 58,
+    alignItems: 'center',
+    paddingHorizontal: 7,
+    paddingVertical: 6,
+    borderRadius: 7,
+    backgroundColor: COLORS.primaryLight,
+  },
+  correctActionText: {
+    color: COLORS.primaryDark,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  deleteActionButton: {
+    backgroundColor: '#FEE2E2',
+  },
+  deleteActionText: {
+    color: COLORS.danger,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  auditCard: {
+    marginHorizontal: 22,
+    marginBottom: 10,
+    padding: 14,
+    backgroundColor: COLORS.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  auditHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 8,
+  },
+  auditAction: {
+    flex: 1,
+    color: COLORS.primary,
+    fontSize: 13,
+    fontWeight: '800',
+    textTransform: 'capitalize',
+  },
+  auditDate: {
+    color: COLORS.textSecondary,
+    fontSize: 10,
+    textAlign: 'right',
+  },
+  auditDetail: {
+    color: COLORS.textPrimary,
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 3,
+  },
+  auditReason: {
+    color: COLORS.textSecondary,
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 7,
+  },
+  modalBackdrop: {
+    flex: 1,
+    justifyContent: 'center',
+    padding: 20,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  modalCard: {
+    padding: 20,
+    backgroundColor: COLORS.card,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  modalTitle: {
+    color: COLORS.textPrimary,
+    fontSize: 19,
+    fontWeight: '800',
+    marginBottom: 12,
+  },
+  modalContext: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 5,
+  },
+  modalWarning: {
+    color: COLORS.danger,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
+  },
+  modalLabel: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 13,
+    marginBottom: 6,
+  },
+  modalInput: {
+    minHeight: 46,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: COLORS.textPrimary,
+    backgroundColor: COLORS.background,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    fontSize: 13,
+  },
+  modalMultilineInput: {
+    minHeight: 82,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 9,
+    marginTop: 18,
+  },
+  modalSecondaryButton: {
+    minHeight: 42,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    borderRadius: 9,
+    backgroundColor: COLORS.background,
+  },
+  modalSecondaryButtonText: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  modalPrimaryButton: {
+    minHeight: 42,
+    minWidth: 118,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    borderRadius: 9,
+    backgroundColor: COLORS.primary,
+  },
+  modalPrimaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  modalDangerButton: {
+    minHeight: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    borderRadius: 9,
+    backgroundColor: COLORS.danger,
+  },
+  modalDangerButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
   },
   studentCard: {
     flexDirection: 'row',
