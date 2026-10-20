@@ -136,6 +136,10 @@ export default function TabLayout() {
         }}
       />
 
+      <Tabs.Screen name="manage-users" options={{ href: null }} />
+      <Tabs.Screen name="event-monitoring" options={{ href: null }} />
+      <Tabs.Screen name="attendance-management" options={{ href: null }} />
+
       {/* HOME */}
       <Tabs.Screen
         name="index"
