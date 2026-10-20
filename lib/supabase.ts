@@ -12,7 +12,24 @@ const authStorage =
   Platform.OS === 'web'
     ? undefined
     : {
-        getItem: (key: string) => SecureStore.getItemAsync(key),
+        getItem: async (key: string) => {
+          const startedAt = Date.now();
+          console.log('AUTH STORAGE: SecureStore read started');
+
+          try {
+            const value = await SecureStore.getItemAsync(key);
+            console.log('AUTH STORAGE: SecureStore read resolved', {
+              durationMs: Date.now() - startedAt,
+              hasValue: value !== null,
+            });
+            return value;
+          } catch (error) {
+            console.error('AUTH STORAGE: SecureStore read failed', {
+              durationMs: Date.now() - startedAt,
+            });
+            throw error;
+          }
+        },
         setItem: (key: string, value: string) =>
           SecureStore.setItemAsync(key, value),
         removeItem: (key: string) => SecureStore.deleteItemAsync(key),

@@ -14,18 +14,36 @@ export type Profile = {
 export async function getProfile(
   userId: string
 ): Promise<Profile | null> {
+  const startedAt = Date.now();
+  console.log('PROFILE LOOKUP: Primary query started');
+
   const { data, error } = await supabase
     .from('profiles')
     .select('id, email, full_name, role, avatar_path')
     .eq('id', userId)
     .maybeSingle();
 
+  console.log('PROFILE LOOKUP: Primary query resolved', {
+    durationMs: Date.now() - startedAt,
+    hasData: !!data,
+    hasError: !!error,
+  });
+
   if (error) {
+    const fallbackStartedAt = Date.now();
+    console.log('PROFILE LOOKUP: Legacy fallback started');
+
     const { data: legacyData, error: legacyError } = await supabase
       .from('profiles')
       .select('id, email, full_name, role')
       .eq('id', userId)
       .maybeSingle();
+
+    console.log('PROFILE LOOKUP: Legacy fallback resolved', {
+      durationMs: Date.now() - fallbackStartedAt,
+      hasData: !!legacyData,
+      hasError: !!legacyError,
+    });
 
     if (!legacyError && legacyData) {
       return {

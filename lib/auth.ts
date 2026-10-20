@@ -59,22 +59,38 @@ export function setAuth(session: Session | null) {
 export function initializeAuth() {
   let active = true;
   const restoreRevision = authRevision;
+  const restoreStartedAt = Date.now();
 
-  globalLoading = true;
-  publishAuthState();
+  console.log('AUTH INIT: Started');
 
   const {
     data: { subscription },
   } = supabase.auth.onAuthStateChange((_event, session) => {
+    console.log('AUTH INIT: Auth event', {
+      event: _event,
+      hasSession: !!session,
+    });
+
     if (active) {
       setAuth(session);
     }
   });
 
+  console.log('AUTH INIT: Session restore requested');
   void supabase.auth
     .getSession()
     .then(({ data, error }) => {
+      console.log('AUTH INIT: Session restore resolved', {
+        durationMs: Date.now() - restoreStartedAt,
+        hasSession: !!data.session,
+        hasError: !!error,
+      });
+
       if (!active || authRevision !== restoreRevision) {
+        console.log('AUTH INIT: Session restore result ignored', {
+          active,
+          superseded: authRevision !== restoreRevision,
+        });
         return;
       }
 
@@ -85,7 +101,15 @@ export function initializeAuth() {
       setAuth(error ? null : data.session);
     })
     .catch((error) => {
+      console.log('AUTH INIT: Session restore rejected', {
+        durationMs: Date.now() - restoreStartedAt,
+      });
+
       if (!active || authRevision !== restoreRevision) {
+        console.log('AUTH INIT: Session restore rejection ignored', {
+          active,
+          superseded: authRevision !== restoreRevision,
+        });
         return;
       }
 
@@ -96,6 +120,7 @@ export function initializeAuth() {
   return () => {
     active = false;
     subscription.unsubscribe();
+    console.log('AUTH INIT: Listener unsubscribed');
   };
 }
 

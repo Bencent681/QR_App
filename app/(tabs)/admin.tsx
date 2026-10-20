@@ -176,7 +176,11 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
     let active = true;
 
     async function loadProfile() {
+      const startedAt = Date.now();
+      console.log('ADMIN ROLE LOOKUP: Started', { hasUser: !!user });
+
       if (!user) {
+        console.log('ADMIN ROLE LOOKUP: Skipped because there is no user');
         setLoading(false);
         return;
       }
@@ -186,6 +190,11 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
 
       try {
         const profile = await getProfile(user.id);
+        console.log('ADMIN ROLE LOOKUP: Resolved', {
+          durationMs: Date.now() - startedAt,
+          hasProfile: !!profile,
+          role: profile?.role ?? null,
+        });
 
         if (!active) return;
 
@@ -203,6 +212,10 @@ const [attendanceSearch, setAttendanceSearch] = useState('');
         }
       } finally {
         if (active) setLoading(false);
+        console.log('ADMIN ROLE LOOKUP: Finished', {
+          durationMs: Date.now() - startedAt,
+          active,
+        });
       }
     }
 

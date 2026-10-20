@@ -17,16 +17,24 @@ export default function TabLayout() {
     let active = true;
 
     async function loadRole() {
+      const startedAt = Date.now();
+      console.log('TAB ROLE LOOKUP: Started', { hasUser: !!user });
       setLoading(true);
       setRole(null);
 
       if (!user) {
+        console.log('TAB ROLE LOOKUP: Skipped because there is no user');
         setLoading(false);
         return;
       }
 
       try {
         const profile = await getProfile(user.id);
+        console.log('TAB ROLE LOOKUP: Resolved', {
+          durationMs: Date.now() - startedAt,
+          hasProfile: !!profile,
+          role: profile?.role ?? null,
+        });
 
         if (active) {
           setRole(profile?.role ?? null);
@@ -41,6 +49,10 @@ export default function TabLayout() {
         if (active) {
           setLoading(false);
         }
+        console.log('TAB ROLE LOOKUP: Finished', {
+          durationMs: Date.now() - startedAt,
+          active,
+        });
       }
     }
 
