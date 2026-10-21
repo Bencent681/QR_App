@@ -1,3 +1,4 @@
+
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
@@ -35,23 +36,8 @@ export default function AdminScreen() {
     <AdminScreenFrame
       access={access}
       title="Admin Dashboard"
-      subtitle="Read-only administration tools"
+      subtitle="Read-only views and secure user role management"
     >
-      <View style={styles.introCard}>
-        <Ionicons
-          name="shield-checkmark-outline"
-          size={24}
-          color={COLORS.primary}
-        />
-        <View style={styles.introTextContainer}>
-          <Text style={styles.introTitle}>Repository-backed views</Text>
-          <Text style={styles.introText}>
-            Screen access is checked in the app, while Supabase RLS controls
-            which records can actually be read.
-          </Text>
-        </View>
-      </View>
-
       <View style={styles.links}>
         {managementLinks.map((item) => (
           <Pressable
@@ -71,10 +57,14 @@ export default function AdminScreen() {
                 color={COLORS.primary}
               />
             </View>
+
             <View style={styles.linkText}>
               <Text style={styles.linkTitle}>{item.title}</Text>
-              <Text style={styles.linkDescription}>{item.description}</Text>
+              <Text style={styles.linkDescription}>
+                {item.description}
+              </Text>
             </View>
+
             <Ionicons
               name="chevron-forward"
               size={20}
@@ -84,44 +74,12 @@ export default function AdminScreen() {
         ))}
       </View>
 
-      <View style={styles.securityNote}>
-        <Text style={styles.securityTitle}>Privileged actions are disabled</Text>
-        <Text style={styles.securityText}>
-          Role changes require a verified server-side operation. Attendance
-          correction and deletion remain disabled because their RPC definitions,
-          grants, and authorization checks are not present in the repository.
-        </Text>
-      </View>
+      
     </AdminScreenFrame>
   );
 }
 
 const styles = StyleSheet.create({
-  introCard: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 12,
-    borderRadius: 14,
-    backgroundColor: COLORS.surface,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    padding: 16,
-    marginBottom: 18,
-  },
-  introTextContainer: {
-    flex: 1,
-    gap: 5,
-  },
-  introTitle: {
-    color: COLORS.textPrimary,
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  introText: {
-    color: COLORS.textSecondary,
-    fontSize: 13,
-    lineHeight: 19,
-  },
   links: {
     gap: 11,
   },
@@ -157,25 +115,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 17,
   },
-  securityNote: {
-    borderRadius: 12,
-    backgroundColor: COLORS.warningLight,
-    borderWidth: 1,
-    borderColor: COLORS.warning,
-    padding: 14,
-    marginTop: 18,
-  },
-  securityTitle: {
-    color: COLORS.warning,
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 5,
-  },
-  securityText: {
-    color: COLORS.textPrimary,
-    fontSize: 12,
-    lineHeight: 18,
-  },
+ 
   pressed: {
     opacity: 0.72,
   },

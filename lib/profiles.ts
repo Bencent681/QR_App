@@ -2,6 +2,7 @@
 import { supabase } from './supabase';
 
 export type Role = 'student' | 'teacher' | 'admin';
+export type AssignableRole = Exclude<Role, 'admin'>;
 
 export type Profile = {
   id: string;
@@ -10,6 +11,35 @@ export type Profile = {
   role: Role;
   avatar_path: string | null;
 };
+
+export async function getAdminUsers(): Promise<
+  Pick<Profile, 'id' | 'full_name' | 'email' | 'role'>[]
+> {
+  const { data, error } = await supabase.rpc('admin_list_users');
+
+  if (error) throw error;
+
+  return (data ?? []) as Pick<
+    Profile,
+    'id' | 'full_name' | 'email' | 'role'
+  >[];
+}
+
+export async function changeAdminUserRole(
+  targetUserId: string,
+  newRole: AssignableRole
+): Promise<void> {
+  if (newRole !== 'student' && newRole !== 'teacher') {
+    throw new Error('The requested role is not supported.');
+  }
+
+  const { error } = await supabase.rpc('admin_change_user_role', {
+    p_target_user_id: targetUserId,
+    p_new_role: newRole,
+  });
+
+  if (error) throw error;
+}
 
 export async function getProfile(
   userId: string

@@ -92,32 +92,13 @@ export async function registerAttendance(
    */
   let event = await getEventByCode(payload.event);
 
-  /*
-   * If the event does not exist in Supabase,
-   * create it.
-   */
+  // Students can only scan events that already exist in Supabase.
   if (!event) {
-    const { data, error } = await supabase
-      .from('events')
-      .insert({
-        event_code: payload.event,
-        title: payload.title,
-        start_time: payload.start || null,
-        end_time: payload.end || null,
-      })
-      .select()
-      .single();
-
-    if (error || !data) {
-      console.log('CREATE EVENT ERROR:', error);
-
-      return {
-        success: false,
-        message: 'Unable to find or create this event.',
-      };
-    }
-
-    event = data;
+    return {
+      success: false,
+      message:
+        'Event not found. Please ask your teacher to create or verify this event.',
+    };
   }
 
   /*
@@ -389,7 +370,7 @@ export async function getTeacherDashboardData(
 }> {
   const { data: events, error: eventError } = await supabase
     .from('events')
-    .select('*')
+    .select('id, event_code, title, start_time, end_time, created_by, created_at')
     .eq('created_by', teacherId)
     .order('created_at', { ascending: false });
 

@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useState } from 'react';
+
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import {
@@ -13,48 +14,127 @@ import {
 
 import AdminScreenFrame from '@/components/AdminScreenFrame';
 import { COLORS } from '@/constants/colors';
-import { supabase } from '@/lib/supabase';
+import {
+  changeAdminUserRole,
+  getAdminUsers,
+  type AssignableRole,
+  type Profile,
+} from '@/lib/profiles';
 import { useAdminAccess } from '@/lib/useAdminAccess';
 
-type ProfileRow = {
-  id: string;
-  full_name: string | null;
-  email: string;
-  role: string;
+type ProfileRow = Pick<Profile, 'id' | 'full_name' | 'email' | 'role'>;
+
+type FeedbackDialog = {
+  title: string;
+  message: string;
 };
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error) return error.message;
+
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+function roleLabel(role: string) {
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
 
 export default function ManageUsersScreen() {
   const access = useAdminAccess();
   const [users, setUsers] = useState<ProfileRow[]>([]);
   const [loading, setLoading] = useState(false);
+  const [savingUserId, setSavingUserId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState('all');
+
+  const [pendingRoleChange, setPendingRoleChange] = useState<{
+    user: ProfileRow;
+    nextRole: AssignableRole;
+  } | null>(null);
+
+  const [dialog, setDialog] = useState<FeedbackDialog | null>(null);
+  const submittingRoleChange = useRef(false);
 
   const loadUsers = useCallback(async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const { data, error: queryError } = await supabase
-        .from('profiles')
-        .select('id, full_name, email, role')
-        .order('full_name', { ascending: true, nullsFirst: false });
-
-      if (queryError) throw queryError;
-      setUsers((data ?? []) as ProfileRow[]);
+      setUsers(await getAdminUsers());
+      return true;
     } catch (loadError) {
       console.error('LOAD ADMIN USERS ERROR:', loadError);
       setUsers([]);
       setError(
-        loadError instanceof Error
-          ? `Unable to load users: ${loadError.message}`
-          : 'Unable to load users. Check profile-table access and try again.'
+        `Unable to load users: ${getErrorMessage(
+          loadError,
+          'Check your connection and try again.'
+        )}`
       );
+      return false;
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const confirmRoleChange = useCallback(
+    (user: ProfileRow, nextRole: AssignableRole) => {
+      setDialog(null);
+      setPendingRoleChange({ user, nextRole });
+    },
+    []
+  );
+
+  const executeRoleChange = useCallback(async () => {
+    if (!pendingRoleChange || submittingRoleChange.current) return;
+
+    const { user, nextRole } = pendingRoleChange;
+
+    submittingRoleChange.current = true;
+    setSavingUserId(user.id);
+    setPendingRoleChange(null);
+    setDialog(null);
+
+    try {
+      await changeAdminUserRole(user.id, nextRole);
+
+      const refreshed = await loadUsers();
+
+      setDialog({
+        title: refreshed
+          ? 'Role updated'
+          : 'Role updated; list not refreshed',
+        message: refreshed
+          ? `${user.full_name?.trim() || user.email} is now a ${roleLabel(
+              nextRole
+            )}.`
+          : 'The role was saved, but the user list could not be refreshed. Please try again.',
+      });
+    } catch (changeError) {
+      console.error('CHANGE ADMIN USER ROLE ERROR:', changeError);
+
+      setDialog({
+        title: 'Role not changed',
+        message: getErrorMessage(
+          changeError,
+          'The role could not be changed. Please try again.'
+        ),
+      });
+    } finally {
+      submittingRoleChange.current = false;
+      setSavingUserId(null);
+    }
+  }, [pendingRoleChange, loadUsers]);
 
   useFocusEffect(
     useCallback(() => {
@@ -88,37 +168,12 @@ export default function ManageUsersScreen() {
     <AdminScreenFrame
       access={access}
       title="Manage Users"
-      subtitle="Search account profiles. Role changes are unavailable until a secure backend operation is verified."
+      subtitle="Search account profiles and change student or teacher roles."
       showBackButton
       refreshing={loading}
       onRefresh={() => void loadUsers()}
     >
-      <View style={styles.readOnlyNotice}>
-        <Ionicons
-          name="lock-closed-outline"
-          size={20}
-          color={COLORS.warning}
-        />
-        <Text style={styles.noticeText}>
-          Read-only: the repository does not define a verified role-management
-          operation. Do not change profiles.role directly from the client.
-          Self-role protection must also be confirmed in Supabase before role
-          controls can be enabled.
-        </Text>
-      </View>
-
-      <View style={styles.policyNotice}>
-        <Ionicons
-          name="information-circle-outline"
-          size={19}
-          color={COLORS.primary}
-        />
-        <Text style={styles.policyNoticeText}>
-          The checked-in profile SELECT policy is owner-only. Until Supabase
-          confirms an administrator read policy, this list may contain only
-          profiles the signed-in account is allowed to read.
-        </Text>
-      </View>
+    
 
       <View style={styles.searchBox}>
         <Ionicons
@@ -213,7 +268,7 @@ export default function ManageUsersScreen() {
           </Text>
           <Text style={styles.stateText}>
             {users.length === 0
-              ? 'Profiles will appear here only when permitted by the deployed profile policies.'
+              ? 'There are no profiles available to display.'
               : 'Try another name, email, user ID, or role filter.'}
           </Text>
         </View>
@@ -223,6 +278,7 @@ export default function ManageUsersScreen() {
             {filteredUsers.length}{' '}
             {filteredUsers.length === 1 ? 'user' : 'users'}
           </Text>
+
           {filteredUsers.map((user) => (
             <View key={user.id} style={styles.userCard}>
               <View style={styles.avatar}>
@@ -231,6 +287,7 @@ export default function ManageUsersScreen() {
                     .toUpperCase()}
                 </Text>
               </View>
+
               <View style={styles.userDetails}>
                 <Text style={styles.userName}>
                   {user.full_name?.trim() || 'Name not provided'}
@@ -240,11 +297,109 @@ export default function ManageUsersScreen() {
                   ID: {user.id}
                 </Text>
               </View>
-              <View style={styles.roleBadge}>
-                <Text style={styles.roleBadgeText}>{user.role}</Text>
+
+              <View style={styles.roleActions}>
+                <View style={styles.roleBadge}>
+                  <Text style={styles.roleBadgeText}>
+                    {roleLabel(user.role)}
+                  </Text>
+                </View>
+
+                {user.id !== access.userId &&
+                (user.role === 'student' || user.role === 'teacher') ? (
+                  <Pressable
+                    onPress={() =>
+                      confirmRoleChange(
+                        user,
+                        user.role === 'student' ? 'teacher' : 'student'
+                      )
+                    }
+                    disabled={savingUserId !== null}
+                    style={({ pressed }) => [
+                      styles.changeRoleButton,
+                      (pressed || savingUserId !== null) &&
+                        styles.changeRoleButtonMuted,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Change ${
+                      user.full_name?.trim() || user.email
+                    } to ${
+                      user.role === 'student' ? 'Teacher' : 'Student'
+                    }`}
+                    accessibilityState={{
+                      disabled: savingUserId !== null,
+                    }}
+                  >
+                    {savingUserId === user.id ? (
+                      <ActivityIndicator size="small" color={COLORS.primary} />
+                    ) : (
+                      <Text style={styles.changeRoleButtonText}>
+                        Change to{' '}
+                        {user.role === 'student' ? 'Teacher' : 'Student'}
+                      </Text>
+                    )}
+                  </Pressable>
+                ) : null}
               </View>
             </View>
           ))}
+        </View>
+      )}
+
+      {pendingRoleChange && (
+        <View style={styles.dialogOverlay}>
+          <View
+            style={styles.dialogCard}
+            accessibilityRole="alert"
+            accessibilityLabel="Confirm role change"
+          >
+            <Text style={styles.dialogTitle}>Confirm role change</Text>
+
+            <Text style={styles.dialogMessage}>
+              Change{' '}
+              {pendingRoleChange.user.full_name?.trim() ||
+                pendingRoleChange.user.email}{' '}
+              from {roleLabel(pendingRoleChange.user.role)} to{' '}
+              {roleLabel(pendingRoleChange.nextRole)}?
+            </Text>
+
+            <View style={styles.dialogActions}>
+              <Pressable
+                onPress={() => setPendingRoleChange(null)}
+                style={styles.dialogCancelButton}
+                accessibilityRole="button"
+              >
+                <Text style={styles.dialogCancelText}>Cancel</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => void executeRoleChange()}
+                style={styles.dialogConfirmButton}
+                accessibilityRole="button"
+              >
+                <Text style={styles.dialogConfirmText}>Change role</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      )}
+
+      {dialog && (
+        <View style={styles.dialogOverlay}>
+          <View style={styles.dialogCard} accessibilityRole="alert">
+            <Text style={styles.dialogTitle}>{dialog.title}</Text>
+            <Text style={styles.dialogMessage}>{dialog.message}</Text>
+
+            <View style={styles.dialogActions}>
+              <Pressable
+                onPress={() => setDialog(null)}
+                style={styles.dialogConfirmButton}
+                accessibilityRole="button"
+              >
+                <Text style={styles.dialogConfirmText}>OK</Text>
+              </Pressable>
+            </View>
+          </View>
         </View>
       )}
     </AdminScreenFrame>
@@ -252,40 +407,7 @@ export default function ManageUsersScreen() {
 }
 
 const styles = StyleSheet.create({
-  readOnlyNotice: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 10,
-    backgroundColor: COLORS.warningLight,
-    borderColor: COLORS.warning,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 18,
-  },
-  noticeText: {
-    flex: 1,
-    color: COLORS.textPrimary,
-    fontSize: 13,
-    lineHeight: 19,
-  },
-  policyNotice: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 10,
-    backgroundColor: COLORS.surface,
-    borderColor: COLORS.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 16,
-  },
-  policyNoticeText: {
-    flex: 1,
-    color: COLORS.textSecondary,
-    fontSize: 13,
-    lineHeight: 19,
-  },
+  
   searchBox: {
     minHeight: 48,
     borderWidth: 1,
@@ -388,7 +510,27 @@ const styles = StyleSheet.create({
     color: COLORS.primary,
     fontSize: 11,
     fontWeight: '700',
-    textTransform: 'uppercase',
+  },
+  roleActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  changeRoleButton: {
+    minHeight: 32,
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.primary,
+    borderRadius: 9,
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+  },
+  changeRoleButtonMuted: {
+    opacity: 0.6,
+  },
+  changeRoleButtonText: {
+    color: COLORS.primary,
+    fontSize: 11,
+    fontWeight: '700',
   },
   stateCard: {
     alignItems: 'center',
@@ -422,5 +564,65 @@ const styles = StyleSheet.create({
     color: COLORS.textOnPrimary,
     fontSize: 13,
     fontWeight: '700',
+  },
+  dialogOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 1000,
+    elevation: 20,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  dialogCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: COLORS.surface,
+    borderRadius: 16,
+    padding: 22,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  dialogTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.textPrimary,
+    marginBottom: 10,
+  },
+  dialogMessage: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: COLORS.textSecondary,
+  },
+  dialogActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 24,
+  },
+  dialogCancelButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  dialogCancelText: {
+    color: COLORS.textPrimary,
+    fontWeight: '600',
+  },
+  dialogConfirmButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 11,
+    borderRadius: 10,
+    backgroundColor: COLORS.primary,
+  },
+  dialogConfirmText: {
+    color: COLORS.textOnPrimary,
+    fontWeight: '600',
   },
 });

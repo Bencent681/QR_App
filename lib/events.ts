@@ -29,18 +29,13 @@ export async function createEvent(
     data: { user },
   } = await supabase.auth.getUser();
 
-  const { error } = await supabase.from('events').upsert(
-    {
-      event_code: event.eventId,
-      title: event.title,
-      start_time: event.start || null,
-      end_time: event.end || null,
-      created_by: user?.id ?? null,
-    },
-    {
-      onConflict: 'event_code',
-    }
-  );
+const { error } = await supabase.from('events').insert({
+  event_code: event.eventId,
+  title: event.title,
+  start_time: event.start || null,
+  end_time: event.end || null,
+  created_by: user?.id ?? null,
+});
 
   return {
     error: error?.message ?? null,
@@ -52,7 +47,7 @@ export async function getEventsByTeacher(
 ): Promise<CloudEvent[]> {
   const { data, error } = await supabase
     .from('events')
-    .select('*')
+    .select('id, event_code, title, start_time, end_time, created_by, created_at')
     .eq('created_by', teacherId)
     .order('created_at', {
       ascending: false,
@@ -83,7 +78,7 @@ export async function getEventByCode(
 ): Promise<CloudEvent | null> {
   const { data, error } = await supabase
     .from('events')
-    .select('*')
+    .select('id, event_code, title, start_time, end_time, created_by, created_at')
     .eq('event_code', code)
     .maybeSingle();
 

@@ -1,0 +1,1311 @@
+BEGIN;
+
+-- This migration targets the live schema described in the accompanying review.
+-- It deliberately does not recreate tables or replace existing application
+-- functions, policies, or storage configuration.
+--
+-- Read-only preflight checks for the live project (not run by this migration):
+--
+-- Effective grants, including table-level grants and inherited role membership:
+--
+-- SELECT c.relname AS table_name,
+--        a.attname AS column_name,
+--        pg_catalog.has_column_privilege('anon', c.oid, a.attnum, 'SELECT') AS anon_select,
+--        pg_catalog.has_column_privilege('anon', c.oid, a.attnum, 'INSERT') AS anon_insert,
+--        pg_catalog.has_column_privilege('anon', c.oid, a.attnum, 'UPDATE') AS anon_update,
+--        pg_catalog.has_column_privilege('authenticated', c.oid, a.attnum, 'SELECT') AS auth_select,
+--        pg_catalog.has_column_privilege('authenticated', c.oid, a.attnum, 'INSERT') AS auth_insert,
+--        pg_catalog.has_column_privilege('authenticated', c.oid, a.attnum, 'UPDATE') AS auth_update
+-- FROM pg_catalog.pg_class AS c
+-- JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+-- JOIN pg_catalog.pg_attribute AS a
+--   ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+-- WHERE n.nspname = 'public'
+--   AND c.relname IN ('profiles', 'events', 'attendance')
+-- ORDER BY c.relname, a.attnum;
+--
+-- Function and trigger owners/security settings; inspect the trigger function
+-- definition to confirm which profile columns it inserts:
+--
+-- SELECT p.oid::regprocedure AS function_name,
+--        r.rolname AS owner,
+--        r.rolbypassrls,
+--        p.prosecdef,
+--        p.proconfig,
+--        pg_catalog.pg_get_functiondef(p.oid) AS definition,
+--        pg_catalog.has_table_privilege(r.rolname, 'public.profiles', 'INSERT') AS owner_table_insert,
+--        pg_catalog.has_column_privilege(r.rolname, 'public.profiles', 'id', 'INSERT') AS owner_insert_id,
+--        pg_catalog.has_column_privilege(r.rolname, 'public.profiles', 'email', 'INSERT') AS owner_insert_email,
+--        pg_catalog.has_column_privilege(r.rolname, 'public.profiles', 'full_name', 'INSERT') AS owner_insert_full_name,
+--        pg_catalog.has_column_privilege(r.rolname, 'public.profiles', 'role', 'INSERT') AS owner_insert_role
+-- FROM pg_catalog.pg_proc AS p
+-- JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+-- JOIN pg_catalog.pg_roles AS r ON r.oid = p.proowner
+-- WHERE n.nspname = 'public'
+--   AND p.proname IN ('current_app_role', 'handle_new_user', 'admin_change_user_role',
+--                     'admin_correct_attendance', 'admin_delete_attendance');
+--
+-- Table owners, RLS/FORCE RLS status, and migration executor capabilities:
+--
+-- SELECT c.relname,
+--        pg_catalog.pg_get_userbyid(c.relowner) AS table_owner,
+--        r.rolbypassrls AS owner_bypasses_rls,
+--        c.relrowsecurity,
+--        c.relforcerowsecurity,
+--        pg_catalog.has_table_privilege(current_user, c.oid, 'SELECT') AS executor_can_select,
+--        CASE WHEN c.relname = 'profiles'
+--             THEN pg_catalog.has_column_privilege(
+--               current_user, c.oid, 'role', 'UPDATE'
+--             ) END AS executor_can_update_role,
+--        CASE WHEN c.relname = 'attendance'
+--             THEN pg_catalog.has_column_privilege(
+--               current_user, c.oid, 'scanned_at', 'UPDATE'
+--             ) END AS executor_can_update_scanned_at,
+--        pg_catalog.has_table_privilege(current_user, c.oid, 'DELETE') AS executor_can_delete
+-- FROM pg_catalog.pg_class AS c
+-- JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+-- JOIN pg_catalog.pg_roles AS r ON r.oid = c.relowner
+-- WHERE n.nspname = 'public'
+--   AND c.relname IN ('profiles', 'attendance')
+-- ORDER BY c.relname;
+--
+-- Existing policy composition, including any restrictive event INSERT/ALL
+-- policy (regardless of its role list) and whether the named policies below
+-- already exist:
+--
+-- SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check
+-- FROM pg_catalog.pg_policies
+-- WHERE schemaname = 'public'
+--   AND tablename IN ('profiles', 'events', 'attendance')
+-- ORDER BY tablename, cmd, policyname;
+--
+-- Confirm objects this migration intends to create do not already exist:
+--
+-- SELECT pg_catalog.to_regclass('public.attendance_audit_log') AS audit_table,
+--        pg_catalog.to_regprocedure(
+--          'public.admin_change_user_role(uuid,text)'
+--        ) AS role_rpc,
+--        pg_catalog.to_regprocedure(
+--          'public.admin_correct_attendance(uuid,timestamp with time zone)'
+--        ) AS correct_rpc,
+--        pg_catalog.to_regprocedure(
+--          'public.admin_delete_attendance(uuid)'
+--        ) AS delete_rpc;
+--
+-- Verify the live admin SELECT policies on profiles/attendance and event
+-- INSERT/UPDATE policies before applying. This migration intentionally does
+-- not add duplicate profile or attendance policies. student_id and short_id
+-- exist in the live profiles table but are not selected by the checked-in app;
+-- no profile SELECT * query was found, so these columns remain ungranted.
+
+DO $migration_preflight$
+DECLARE
+  v_executor_oid pg_catalog.oid;
+  v_executor_bypass_rls pg_catalog.boolean;
+  v_helper_source pg_catalog.text;
+  v_role_constraint_found pg_catalog.boolean;
+  v_profile_owner_read_found pg_catalog.boolean;
+  v_profile_admin_read_found pg_catalog.boolean;
+  v_profile_owner_update_found pg_catalog.boolean;
+  v_attendance_student_read_found pg_catalog.boolean;
+  v_attendance_teacher_read_found pg_catalog.boolean;
+  v_attendance_admin_read_found pg_catalog.boolean;
+  v_attendance_student_insert_found pg_catalog.boolean;
+  v_event_read_found pg_catalog.boolean;
+  v_event_owner_update_found pg_catalog.boolean;
+BEGIN
+  SELECT role.oid, role.rolbypassrls
+    INTO v_executor_oid, v_executor_bypass_rls
+    FROM pg_catalog.pg_roles AS role
+    WHERE role.rolname = current_user;
+
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_roles AS role
+      WHERE role.rolname = 'service_role'
+  ) THEN
+    RAISE EXCEPTION
+      'Required Supabase role service_role is missing; cannot preserve its existing table access.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM (VALUES
+        ('profiles', 'id'), ('profiles', 'email'),
+        ('profiles', 'full_name'), ('profiles', 'role'),
+        ('profiles', 'created_at'), ('profiles', 'updated_at'),
+        ('profiles', 'student_id'), ('profiles', 'short_id'),
+        ('profiles', 'avatar_path'),
+        ('events', 'id'), ('events', 'event_code'),
+        ('events', 'title'), ('events', 'start_time'),
+        ('events', 'end_time'), ('events', 'created_by'),
+        ('events', 'created_at'),
+        ('attendance', 'id'), ('attendance', 'student_id'),
+        ('attendance', 'event_id'), ('attendance', 'scanned_at')
+      ) AS required(table_name, column_name)
+      WHERE NOT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_class AS relation
+          JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          JOIN pg_catalog.pg_attribute AS attribute
+            ON attribute.attrelid = relation.oid
+          WHERE namespace.nspname = 'public'
+            AND relation.relname = required.table_name
+            AND attribute.attname = required.column_name
+            AND attribute.attnum > 0
+            AND NOT attribute.attisdropped
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'Required profiles/events/attendance columns are missing; compare this project with the documented schema before applying.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM (VALUES ('profiles'), ('events'), ('attendance'))
+        AS required(table_name)
+      LEFT JOIN pg_catalog.pg_class AS relation
+        ON relation.oid = pg_catalog.to_regclass(
+          'public.' || required.table_name
+        )
+      WHERE relation.oid IS NULL OR NOT relation.relrowsecurity
+  ) THEN
+    RAISE EXCEPTION
+      'RLS must be enabled on public.profiles, public.events, and public.attendance before tightening client grants.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_class AS relation
+      JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'public'
+        AND relation.relname IN ('profiles', 'events', 'attendance')
+        AND relation.relowner <> v_executor_oid
+  ) THEN
+    RAISE EXCEPTION
+      'The migration executor must own profiles, events, and attendance to apply policies and preserve service_role ACLs transactionally.';
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_constraint AS constraint_row
+      JOIN pg_catalog.pg_class AS relation
+        ON relation.oid = constraint_row.conrelid
+      JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.oid = relation.relnamespace
+      JOIN pg_catalog.pg_attribute AS role_attribute
+        ON role_attribute.attrelid = relation.oid
+       AND role_attribute.attname = 'role'
+      WHERE namespace.nspname = 'public'
+        AND relation.relname = 'profiles'
+        AND constraint_row.contype = 'c'
+        AND constraint_row.conkey @>
+          ARRAY[role_attribute.attnum]::pg_catalog.smallint[]
+        AND pg_catalog.strpos(
+          pg_catalog.pg_get_constraintdef(constraint_row.oid),
+          'student'
+        ) > 0
+        AND pg_catalog.strpos(
+          pg_catalog.pg_get_constraintdef(constraint_row.oid),
+          'teacher'
+        ) > 0
+        AND pg_catalog.strpos(
+          pg_catalog.pg_get_constraintdef(constraint_row.oid),
+          'admin'
+        ) > 0
+  )
+  INTO v_role_constraint_found;
+
+  IF NOT v_role_constraint_found THEN
+    RAISE EXCEPTION
+      'A profiles role CHECK constraint allowing student, teacher, and admin is required; this migration does not alter the constraint.';
+  END IF;
+
+  SELECT pg_catalog.lower(
+           pg_catalog.regexp_replace(
+             pg_catalog.regexp_replace(
+               pg_catalog.btrim(function_row.prosrc),
+               '[[:space:]]+',
+               '',
+               'g'
+             ),
+             ';$',
+             ''
+           )
+         )
+    INTO v_helper_source
+    FROM pg_catalog.pg_proc AS function_row
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = function_row.pronamespace
+    JOIN pg_catalog.pg_language AS language_row
+      ON language_row.oid = function_row.prolang
+    WHERE namespace.nspname = 'public'
+      AND function_row.proname = 'current_app_role'
+      AND function_row.pronargs = 0
+      AND function_row.prorettype = 'pg_catalog.text'::pg_catalog.regtype
+      AND function_row.provolatile = 's'
+      AND function_row.prosecdef
+      AND language_row.lanname = 'sql'
+      AND function_row.proconfig @> ARRAY['search_path=""']::pg_catalog.text[];
+
+  IF v_helper_source IS NULL
+     OR v_helper_source NOT IN (
+       'selectrolefrompublic.profileswhereid=auth.uid()',
+       'selectpublic.profiles.rolefrompublic.profileswherepublic.profiles.id=auth.uid()'
+     ) THEN
+    RAISE EXCEPTION
+      'public.current_app_role() must be a zero-argument STABLE SQL SECURITY DEFINER text function with empty search_path that reads public.profiles using auth.uid().';
+  END IF;
+
+  SELECT
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'profiles'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%auth.uid()%'
+        AND policy.qual ILIKE '%id%'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'profiles'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%admin%'
+        AND (
+          policy.qual ILIKE '%current_app_role%'
+          OR policy.qual ILIKE '%role%'
+        )
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'profiles'
+        AND policy.cmd = 'UPDATE'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%auth.uid()%'
+        AND policy.qual ILIKE '%id%'
+        AND policy.with_check ILIKE '%auth.uid()%'
+        AND policy.with_check ILIKE '%id%'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'attendance'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%auth.uid()%'
+        AND policy.qual ILIKE '%student_id%'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'attendance'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%events%'
+        AND policy.qual ILIKE '%created_by%'
+        AND policy.qual ILIKE '%auth.uid()%'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'attendance'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%admin%'
+        AND (
+          policy.qual ILIKE '%current_app_role%'
+          OR policy.qual ILIKE '%role%'
+        )
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'attendance'
+        AND policy.cmd = 'INSERT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.with_check ILIKE '%auth.uid()%'
+        AND policy.with_check ILIKE '%student_id%'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'events'
+        AND policy.cmd = 'SELECT'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND pg_catalog.btrim(policy.qual) = 'true'
+    ),
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'events'
+        AND policy.cmd = 'UPDATE'
+        AND policy.permissive = 'PERMISSIVE'
+        AND (policy.roles @> ARRAY['authenticated'::pg_catalog.name]
+          OR policy.roles @> ARRAY['public'::pg_catalog.name])
+        AND policy.qual ILIKE '%auth.uid()%'
+        AND policy.qual ILIKE '%created_by%'
+        AND policy.with_check ILIKE '%auth.uid()%'
+        AND policy.with_check ILIKE '%created_by%'
+    )
+  INTO v_profile_owner_read_found,
+       v_profile_admin_read_found,
+       v_profile_owner_update_found,
+       v_attendance_student_read_found,
+       v_attendance_teacher_read_found,
+       v_attendance_admin_read_found,
+       v_attendance_student_insert_found,
+       v_event_read_found,
+       v_event_owner_update_found;
+
+  IF NOT v_profile_owner_read_found
+     OR NOT v_profile_admin_read_found
+     OR NOT v_profile_owner_update_found
+     OR NOT v_attendance_student_read_found
+     OR NOT v_attendance_teacher_read_found
+     OR NOT v_attendance_admin_read_found
+     OR NOT v_attendance_student_insert_found
+     OR NOT v_event_read_found
+     OR NOT v_event_owner_update_found THEN
+    RAISE EXCEPTION
+      'Required existing RLS policies are missing or do not match the profile owner/admin, attendance student/teacher/admin, or event authenticated-read/owner-update access model; inspect pg_catalog.pg_policies.';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_trigger AS trigger_row
+      JOIN pg_catalog.pg_proc AS function_row
+        ON function_row.oid = trigger_row.tgfoid
+      JOIN pg_catalog.pg_namespace AS function_namespace
+        ON function_namespace.oid = function_row.pronamespace
+      JOIN pg_catalog.pg_class AS auth_users
+        ON auth_users.oid = trigger_row.tgrelid
+      JOIN pg_catalog.pg_namespace AS auth_namespace
+        ON auth_namespace.oid = auth_users.relnamespace
+      WHERE auth_namespace.nspname = 'auth'
+        AND auth_users.relname = 'users'
+        AND trigger_row.tgname = 'on_auth_user_created'
+        AND trigger_row.tgenabled IN ('O', 'A')
+        AND trigger_row.tgtype = 5
+        AND NOT trigger_row.tgisinternal
+        AND function_namespace.nspname = 'public'
+        AND function_row.proname = 'handle_new_user'
+        AND function_row.pronargs = 0
+        AND function_row.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
+        AND function_row.prosecdef
+  ) THEN
+    RAISE EXCEPTION
+      'Enabled auth.users trigger on_auth_user_created invoking SECURITY DEFINER public.handle_new_user() is required.';
+  END IF;
+
+  IF NOT pg_catalog.has_table_privilege(current_user, 'public.profiles', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.profiles', 'role', 'UPDATE'
+     )
+     OR NOT pg_catalog.has_table_privilege(current_user, 'public.attendance', 'SELECT')
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'scanned_at', 'UPDATE'
+     )
+     OR NOT pg_catalog.has_table_privilege(current_user, 'public.attendance', 'DELETE') THEN
+    RAISE EXCEPTION
+      'Migration executor must be able to read profiles/attendance, update profiles.role and attendance.scanned_at, and delete attendance.';
+  END IF;
+
+  IF NOT v_executor_bypass_rls AND EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_class AS relation
+      JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'public'
+        AND relation.relname IN ('profiles', 'attendance')
+        AND relation.relrowsecurity
+        AND (
+          relation.relowner <> v_executor_oid
+          OR relation.relforcerowsecurity
+        )
+  ) THEN
+    RAISE EXCEPTION
+      'Migration executor would not bypass RLS for SECURITY DEFINER operations with row_security = off.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'events'
+        AND policy.cmd IN ('INSERT', 'ALL')
+        AND policy.permissive = 'RESTRICTIVE'
+  ) THEN
+    RAISE EXCEPTION
+      'Review existing restrictive event INSERT policies before adding the guard; a restrictive policy assigned through role membership may block intended event inserts.';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_policies AS policy
+      WHERE policy.schemaname = 'public'
+        AND policy.tablename = 'events'
+        AND policy.policyname IN (
+          'event_insert_role_and_owner_allow',
+          'event_insert_role_and_owner_guard'
+        )
+  ) THEN
+    RAISE EXCEPTION
+      'An event INSERT policy name used by this migration already exists; inspect it rather than creating a duplicate.';
+  END IF;
+
+  IF pg_catalog.to_regclass('public.attendance_audit_log') IS NOT NULL
+     OR pg_catalog.to_regprocedure(
+       'public.admin_change_user_role(uuid,text)'
+     ) IS NOT NULL
+     OR pg_catalog.to_regprocedure(
+       'public.admin_correct_attendance(uuid,timestamp with time zone)'
+     ) IS NOT NULL
+     OR pg_catalog.to_regprocedure(
+       'public.admin_delete_attendance(uuid)'
+     ) IS NOT NULL THEN
+    RAISE EXCEPTION
+      'An audit table or admin RPC intended by this migration already exists; inspect it before proceeding.';
+  END IF;
+END;
+$migration_preflight$;
+
+-- Preserve service_role's existing effective table and column privileges
+-- before revoking PUBLIC grants. The snapshot is transaction-local. Any
+-- privileges received through PUBLIC or inherited roles are restored directly
+-- to service_role; inability to restore them aborts the transaction.
+CREATE TEMPORARY TABLE _admin_migration_service_role_privileges (
+  relation_name pg_catalog.text NOT NULL,
+  column_name pg_catalog.text NOT NULL DEFAULT '',
+  privilege_name pg_catalog.text NOT NULL,
+  is_column_privilege pg_catalog.boolean NOT NULL,
+  PRIMARY KEY (
+    relation_name, column_name, privilege_name, is_column_privilege
+  )
+) ON COMMIT DROP;
+
+DO $service_role_privilege_snapshot$
+DECLARE
+  v_relation pg_catalog.text;
+  v_privilege pg_catalog.text;
+  v_column record;
+BEGIN
+  FOREACH v_relation IN ARRAY ARRAY[
+    'profiles', 'events', 'attendance'
+  ]::pg_catalog.text[] LOOP
+    FOREACH v_privilege IN ARRAY ARRAY[
+      'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES',
+      'TRIGGER', 'TRUNCATE', 'MAINTAIN'
+    ]::pg_catalog.text[] LOOP
+      IF pg_catalog.has_table_privilege(
+        'service_role',
+        'public.' || v_relation,
+        v_privilege
+      ) THEN
+        INSERT INTO pg_temp._admin_migration_service_role_privileges
+          (relation_name, column_name, privilege_name, is_column_privilege)
+        VALUES (v_relation, '', v_privilege, false);
+      END IF;
+    END LOOP;
+
+    FOR v_column IN
+      SELECT attribute.attname
+        FROM pg_catalog.pg_attribute AS attribute
+        WHERE attribute.attrelid =
+          pg_catalog.to_regclass('public.' || v_relation)
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+    LOOP
+      FOREACH v_privilege IN ARRAY ARRAY[
+        'SELECT', 'INSERT', 'UPDATE', 'REFERENCES'
+      ]::pg_catalog.text[] LOOP
+        IF pg_catalog.has_column_privilege(
+          'service_role',
+          'public.' || v_relation,
+          v_column.attname::pg_catalog.text,
+          v_privilege
+        )
+        AND NOT pg_catalog.has_table_privilege(
+          'service_role',
+          'public.' || v_relation,
+          v_privilege
+        ) THEN
+          INSERT INTO pg_temp._admin_migration_service_role_privileges
+            (relation_name, column_name, privilege_name, is_column_privilege)
+          VALUES (
+            v_relation, v_column.attname, v_privilege, true
+          );
+        END IF;
+      END LOOP;
+    END LOOP;
+  END LOOP;
+END;
+$service_role_privilege_snapshot$;
+
+-- Remove broad grants first, then grant only the columns used by the app.
+REVOKE ALL PRIVILEGES ON TABLE public.profiles
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL PRIVILEGES ON TABLE public.events
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL PRIVILEGES ON TABLE public.attendance
+  FROM PUBLIC, anon, authenticated;
+
+-- Table-level REVOKE does not remove separately granted column privileges.
+-- Clear the known live columns as well, particularly profiles.role.
+REVOKE SELECT (
+  id, email, full_name, role, created_at, updated_at,
+  student_id, short_id, avatar_path
+) ON TABLE public.profiles FROM PUBLIC, anon, authenticated;
+REVOKE INSERT (
+  id, email, full_name, role, created_at, updated_at,
+  student_id, short_id, avatar_path
+) ON TABLE public.profiles FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE (
+  id, email, full_name, role, created_at, updated_at,
+  student_id, short_id, avatar_path
+) ON TABLE public.profiles FROM PUBLIC, anon, authenticated;
+REVOKE REFERENCES (
+  id, email, full_name, role, created_at, updated_at,
+  student_id, short_id, avatar_path
+) ON TABLE public.profiles FROM PUBLIC, anon, authenticated;
+
+REVOKE SELECT (
+  id, event_code, title, start_time, end_time, created_by, created_at
+) ON TABLE public.events FROM PUBLIC, anon, authenticated;
+REVOKE INSERT (
+  id, event_code, title, start_time, end_time, created_by, created_at
+) ON TABLE public.events FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE (
+  id, event_code, title, start_time, end_time, created_by, created_at
+) ON TABLE public.events FROM PUBLIC, anon, authenticated;
+REVOKE REFERENCES (
+  id, event_code, title, start_time, end_time, created_by, created_at
+) ON TABLE public.events FROM PUBLIC, anon, authenticated;
+
+REVOKE SELECT (
+  id, student_id, event_id, scanned_at
+) ON TABLE public.attendance FROM PUBLIC, anon, authenticated;
+REVOKE INSERT (
+  id, student_id, event_id, scanned_at
+) ON TABLE public.attendance FROM PUBLIC, anon, authenticated;
+REVOKE UPDATE (
+  id, student_id, event_id, scanned_at
+) ON TABLE public.attendance FROM PUBLIC, anon, authenticated;
+REVOKE REFERENCES (
+  id, student_id, event_id, scanned_at
+) ON TABLE public.attendance FROM PUBLIC, anon, authenticated;
+
+-- Restore precisely the service_role access captured above. Privilege names
+-- are drawn from fixed privilege lists; relation/column identifiers come from
+-- the known tables and their live catalog metadata.
+DO $service_role_privilege_restore$
+DECLARE
+  v_saved record;
+BEGIN
+  FOR v_saved IN
+    SELECT relation_name, column_name, privilege_name, is_column_privilege
+      FROM pg_temp._admin_migration_service_role_privileges
+  LOOP
+    IF v_saved.is_column_privilege THEN
+      EXECUTE pg_catalog.format(
+        'GRANT %s (%I) ON TABLE public.%I TO service_role',
+        v_saved.privilege_name,
+        v_saved.column_name,
+        v_saved.relation_name
+      );
+    ELSE
+      EXECUTE pg_catalog.format(
+        'GRANT %s ON TABLE public.%I TO service_role',
+        v_saved.privilege_name,
+        v_saved.relation_name
+      );
+    END IF;
+
+    IF v_saved.is_column_privilege
+       AND NOT pg_catalog.has_column_privilege(
+         'service_role',
+         'public.' || v_saved.relation_name,
+         v_saved.column_name,
+         v_saved.privilege_name
+       ) THEN
+      RAISE EXCEPTION
+        'Could not preserve service_role column % privilege on public.%.%.',
+        v_saved.privilege_name, v_saved.relation_name, v_saved.column_name;
+    ELSIF NOT v_saved.is_column_privilege
+       AND NOT pg_catalog.has_table_privilege(
+         'service_role',
+         'public.' || v_saved.relation_name,
+         v_saved.privilege_name
+       ) THEN
+      RAISE EXCEPTION
+        'Could not preserve service_role table % privilege on public.%.',
+        v_saved.privilege_name, v_saved.relation_name;
+    END IF;
+  END LOOP;
+END;
+$service_role_privilege_restore$;
+
+-- Fail closed if an inherited grant from another role still gives clients
+-- direct profile creation or role-column writes after the explicit revokes.
+DO $profile_role_privilege_check$
+BEGIN
+  IF pg_catalog.has_table_privilege(
+       'anon', 'public.profiles', 'INSERT'
+     )
+     OR pg_catalog.has_table_privilege(
+       'authenticated', 'public.profiles', 'INSERT'
+     )
+     OR pg_catalog.has_column_privilege(
+       'anon', 'public.profiles', 'role', 'INSERT'
+     )
+     OR pg_catalog.has_column_privilege(
+       'authenticated', 'public.profiles', 'role', 'INSERT'
+     )
+     OR pg_catalog.has_column_privilege(
+       'anon', 'public.profiles', 'role', 'UPDATE'
+     )
+     OR pg_catalog.has_column_privilege(
+       'authenticated', 'public.profiles', 'role', 'UPDATE'
+     ) THEN
+    RAISE EXCEPTION
+      'anon/authenticated retain an effective profile INSERT or role-column write privilege; inspect inherited grants and revoke them from their source roles.';
+  END IF;
+END;
+$profile_role_privilege_check$;
+
+-- Current app profile queries request only these explicit columns; no profile
+-- SELECT * query exists in the checked-in app. student_id and short_id are
+-- deliberately not granted until a screen actually reads them.
+GRANT SELECT (id, email, full_name, role, avatar_path)
+  ON TABLE public.profiles TO authenticated;
+GRANT UPDATE (full_name, avatar_path)
+  ON TABLE public.profiles TO authenticated;
+
+GRANT SELECT (id, event_code, title, start_time, end_time, created_by, created_at)
+  ON TABLE public.events TO authenticated;
+GRANT INSERT (event_code, title, start_time, end_time, created_by)
+  ON TABLE public.events TO authenticated;
+GRANT UPDATE (event_code, title, start_time, end_time, created_by)
+  ON TABLE public.events TO authenticated;
+
+GRANT SELECT (id, student_id, event_id, scanned_at)
+  ON TABLE public.attendance TO authenticated;
+GRANT INSERT (student_id, event_id, scanned_at)
+  ON TABLE public.attendance TO authenticated;
+
+-- Fail closed if anon/authenticated retain any direct table-level privilege
+-- or any column privilege outside the app's explicit access matrix, including
+-- privileges inherited through role memberships. service_role is not changed.
+DO $effective_client_privilege_check$
+DECLARE
+  v_client pg_catalog.text;
+  v_relation pg_catalog.text;
+  v_privilege pg_catalog.text;
+  v_column record;
+  v_allowed pg_catalog.boolean;
+  v_effective pg_catalog.boolean;
+BEGIN
+  FOREACH v_client IN ARRAY ARRAY['anon', 'authenticated']::pg_catalog.text[] LOOP
+    FOREACH v_relation IN ARRAY ARRAY[
+      'profiles', 'events', 'attendance'
+    ]::pg_catalog.text[] LOOP
+      FOREACH v_privilege IN ARRAY ARRAY[
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE',
+        'REFERENCES', 'TRIGGER', 'TRUNCATE', 'MAINTAIN'
+      ]::pg_catalog.text[] LOOP
+        IF pg_catalog.has_table_privilege(
+          v_client,
+          'public.' || v_relation,
+          v_privilege
+        ) THEN
+          RAISE EXCEPTION
+            'Role % retains unexpected table-level % privilege on public.%; inspect inherited grants.',
+            v_client, v_privilege, v_relation;
+        END IF;
+      END LOOP;
+
+      FOR v_column IN
+        SELECT attribute.attname
+          FROM pg_catalog.pg_attribute AS attribute
+          WHERE attribute.attrelid =
+            pg_catalog.to_regclass('public.' || v_relation)
+            AND attribute.attnum > 0
+            AND NOT attribute.attisdropped
+      LOOP
+        FOREACH v_privilege IN ARRAY ARRAY[
+          'SELECT', 'INSERT', 'UPDATE', 'REFERENCES'
+        ]::pg_catalog.text[] LOOP
+          v_effective := pg_catalog.has_column_privilege(
+            v_client,
+            'public.' || v_relation,
+            v_column.attname::pg_catalog.text,
+            v_privilege
+          );
+
+          v_allowed :=
+            v_client = 'authenticated'
+            AND CASE
+              WHEN v_privilege = 'SELECT' AND v_relation = 'profiles'
+                THEN v_column.attname IN (
+                  'id', 'email', 'full_name', 'role', 'avatar_path'
+                )
+              WHEN v_privilege = 'UPDATE' AND v_relation = 'profiles'
+                THEN v_column.attname IN ('full_name', 'avatar_path')
+              WHEN v_privilege = 'SELECT' AND v_relation = 'events'
+                THEN v_column.attname IN (
+                  'id', 'event_code', 'title', 'start_time',
+                  'end_time', 'created_by', 'created_at'
+                )
+              WHEN v_privilege IN ('INSERT', 'UPDATE')
+                   AND v_relation = 'events'
+                THEN v_column.attname IN (
+                  'event_code', 'title', 'start_time', 'end_time',
+                  'created_by'
+                )
+              WHEN v_privilege = 'SELECT' AND v_relation = 'attendance'
+                THEN v_column.attname IN (
+                  'id', 'student_id', 'event_id', 'scanned_at'
+                )
+              WHEN v_privilege = 'INSERT' AND v_relation = 'attendance'
+                THEN v_column.attname IN (
+                  'student_id', 'event_id', 'scanned_at'
+                )
+              ELSE false
+            END;
+
+          IF v_effective IS DISTINCT FROM v_allowed THEN
+            RAISE EXCEPTION
+              'Role % has unexpected effective % privilege on public.%.%; expected %.',
+              v_client, v_privilege, v_relation, v_column.attname,
+              v_allowed;
+          END IF;
+        END LOOP;
+      END LOOP;
+    END LOOP;
+  END LOOP;
+END;
+$effective_client_privilege_check$;
+
+-- New SECURITY DEFINER functions are owned by the role applying this
+-- migration. Verify its required privileges still exist after the revokes.
+DO $post_grant_preflight$
+DECLARE
+  v_trigger_owner pg_catalog.oid;
+  v_trigger_owner_name pg_catalog.name;
+  v_trigger_owner_bypass_rls pg_catalog.boolean;
+  v_trigger_is_security_definer pg_catalog.boolean;
+  v_trigger_source pg_catalog.text;
+  v_trigger_insert_match pg_catalog.text[];
+  v_trigger_insert_column pg_catalog.text;
+  v_profile_insert_count pg_catalog.integer;
+  v_profile_insert_match_count pg_catalog.integer := 0;
+  v_trigger_insert_columns_ok pg_catalog.boolean := true;
+  v_profile_owner pg_catalog.oid;
+  v_profile_rls pg_catalog.boolean;
+  v_profile_force_rls pg_catalog.boolean;
+BEGIN
+  IF NOT pg_catalog.has_column_privilege(
+       current_user, 'public.profiles', 'id', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.profiles', 'role', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.profiles', 'role', 'UPDATE'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'id', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'student_id', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'event_id', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'scanned_at', 'SELECT'
+     )
+     OR NOT pg_catalog.has_column_privilege(
+       current_user, 'public.attendance', 'scanned_at', 'UPDATE'
+     )
+     OR NOT pg_catalog.has_table_privilege(
+       current_user, 'public.attendance', 'DELETE'
+     ) THEN
+    RAISE EXCEPTION
+      'Migration executor lacks required profile/attendance privileges after column grants are tightened.';
+  END IF;
+
+  SELECT profile.relowner, profile.relrowsecurity, profile.relforcerowsecurity
+    INTO v_profile_owner, v_profile_rls, v_profile_force_rls
+    FROM pg_catalog.pg_class AS profile
+    WHERE profile.oid = 'public.profiles'::pg_catalog.regclass;
+
+  SELECT function_row.proowner, owner_role.rolname,
+         owner_role.rolbypassrls, function_row.prosecdef,
+         function_row.prosrc
+    INTO v_trigger_owner, v_trigger_owner_name,
+         v_trigger_owner_bypass_rls, v_trigger_is_security_definer,
+         v_trigger_source
+    FROM pg_catalog.pg_trigger AS trigger_row
+    JOIN pg_catalog.pg_proc AS function_row
+      ON function_row.oid = trigger_row.tgfoid
+    JOIN pg_catalog.pg_roles AS owner_role
+      ON owner_role.oid = function_row.proowner
+    WHERE trigger_row.tgrelid = 'auth.users'::pg_catalog.regclass
+      AND NOT trigger_row.tgisinternal
+      AND function_row.proname = 'handle_new_user';
+
+  v_profile_insert_count := pg_catalog.regexp_count(
+    pg_catalog.lower(v_trigger_source),
+    'insert[[:space:]]+into[[:space:]]+(public[.])?profiles'
+  );
+
+  FOR v_trigger_insert_match IN
+    SELECT match_result.match_parts
+      FROM pg_catalog.regexp_matches(
+        v_trigger_source,
+        'insert[[:space:]]+into[[:space:]]+(public[.])?profiles[[:space:]]*[(]([^)]*)[)]',
+        'gi'
+      ) AS match_result(match_parts)
+  LOOP
+    v_profile_insert_match_count := v_profile_insert_match_count + 1;
+
+    FOREACH v_trigger_insert_column IN ARRAY
+      pg_catalog.string_to_array(v_trigger_insert_match[2], ',')
+    LOOP
+      v_trigger_insert_column := pg_catalog.lower(
+        pg_catalog.btrim(v_trigger_insert_column, E' \t\n\r"')
+      );
+
+      IF v_trigger_insert_column = ''
+         OR NOT pg_catalog.has_column_privilege(
+           v_trigger_owner_name,
+           'public.profiles',
+           v_trigger_insert_column,
+           'INSERT'
+         ) THEN
+        v_trigger_insert_columns_ok := false;
+      END IF;
+    END LOOP;
+  END LOOP;
+
+  IF v_trigger_owner IS NULL
+     OR NOT v_trigger_is_security_definer
+     OR NOT (
+       pg_catalog.has_table_privilege(
+         v_trigger_owner_name, 'public.profiles', 'INSERT'
+       )
+       OR (
+         v_profile_insert_count > 0
+         AND v_profile_insert_match_count = v_profile_insert_count
+         AND v_trigger_insert_columns_ok
+       )
+     ) THEN
+    RAISE EXCEPTION
+      'The existing handle_new_user trigger must remain SECURITY DEFINER and its owner must retain table-level INSERT or INSERT privileges on every explicitly listed public.profiles column after client grants are revoked.';
+  END IF;
+
+  IF v_profile_rls
+     AND (
+       (v_profile_force_rls AND NOT v_trigger_owner_bypass_rls)
+       OR (
+         NOT v_trigger_owner_bypass_rls
+         AND v_trigger_owner <> v_profile_owner
+       )
+     ) THEN
+    RAISE EXCEPTION
+      'The existing handle_new_user trigger owner would be subject to profile RLS after client grants are revoked.';
+  END IF;
+END;
+$post_grant_preflight$;
+
+-- The existing helper returns the caller's own database role and is used by
+-- the server-side event and audit policies below.
+GRANT EXECUTE ON FUNCTION public.current_app_role() TO authenticated;
+
+-- Only teachers/admins may create caller-owned events. Students cannot insert
+-- owned or unowned event rows; QR scans must resolve to an existing event.
+-- The permissive policy allows the intended inserts, while the restrictive
+-- policy prevents any broader existing permissive policy from bypassing the
+-- role and ownership rules.
+CREATE POLICY "event_insert_role_and_owner_allow"
+  ON public.events
+  AS PERMISSIVE
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    public.current_app_role() IN ('teacher', 'admin')
+    AND public.events.created_by = auth.uid()
+  );
+
+CREATE POLICY "event_insert_role_and_owner_guard"
+  ON public.events
+  AS RESTRICTIVE
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    public.current_app_role() IN ('teacher', 'admin')
+    AND public.events.created_by = auth.uid()
+  );
+
+CREATE TABLE public.attendance_audit_log (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  actor_id uuid NOT NULL,
+  action text NOT NULL CHECK (action IN ('correct', 'delete')),
+  target_attendance_id uuid NOT NULL,
+  occurred_at timestamp with time zone NOT NULL
+    DEFAULT pg_catalog.clock_timestamp(),
+  before_data jsonb NOT NULL,
+  after_data jsonb,
+  CONSTRAINT attendance_audit_log_action_data_check CHECK (
+    (action = 'correct' AND after_data IS NOT NULL)
+    OR (action = 'delete' AND after_data IS NULL)
+  )
+);
+
+DO $audit_table_owner_check$
+DECLARE
+  v_executor_oid pg_catalog.oid;
+  v_audit_owner_oid pg_catalog.oid;
+BEGIN
+  SELECT role.oid
+    INTO v_executor_oid
+    FROM pg_catalog.pg_roles AS role
+    WHERE role.rolname = current_user;
+
+  SELECT relation.relowner
+    INTO v_audit_owner_oid
+    FROM pg_catalog.pg_class AS relation
+    WHERE relation.oid = 'public.attendance_audit_log'::pg_catalog.regclass;
+
+  IF v_audit_owner_oid IS DISTINCT FROM v_executor_oid THEN
+    RAISE EXCEPTION
+      'Migration executor must own attendance_audit_log so its SECURITY DEFINER functions can write audit rows.';
+  END IF;
+END;
+$audit_table_owner_check$;
+
+ALTER TABLE public.attendance_audit_log ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL PRIVILEGES ON TABLE public.attendance_audit_log
+  FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.attendance_audit_log TO authenticated;
+
+CREATE POLICY "attendance_audit_log_admin_read"
+  ON public.attendance_audit_log
+  FOR SELECT
+  TO authenticated
+  USING (public.current_app_role() = 'admin');
+
+CREATE FUNCTION public.admin_change_user_role(
+  p_target_user_id pg_catalog.uuid,
+  p_new_role pg_catalog.text
+)
+RETURNS pg_catalog.void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+SET row_security = off
+AS $function$
+DECLARE
+  v_actor_id pg_catalog.uuid;
+  v_actor_role pg_catalog.text;
+  v_target_role pg_catalog.text;
+  v_admin_count pg_catalog.bigint;
+BEGIN
+  v_actor_id := auth.uid();
+
+  IF v_actor_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required.'
+      USING ERRCODE = '28000';
+  END IF;
+
+  IF p_target_user_id IS NULL THEN
+    RAISE EXCEPTION 'A target user ID is required.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_new_role IS NULL
+     OR p_new_role NOT IN ('student', 'teacher', 'admin') THEN
+    RAISE EXCEPTION 'The requested role is invalid.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Serialize role changes so concurrent requests cannot demote the last admin.
+  PERFORM pg_catalog.pg_advisory_xact_lock(20261020, 15001);
+
+  SELECT profile.role
+    INTO v_actor_role
+    FROM public.profiles AS profile
+    WHERE profile.id = v_actor_id
+    FOR UPDATE;
+
+  IF v_actor_role IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Administrator access is required.'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF p_target_user_id = v_actor_id THEN
+    RAISE EXCEPTION 'Administrators cannot change their own role.'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT profile.role
+    INTO v_target_role
+    FROM public.profiles AS profile
+    WHERE profile.id = p_target_user_id
+    FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The target profile does not exist.'
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_target_role = 'admin' AND p_new_role <> 'admin' THEN
+    SELECT pg_catalog.count(*)
+      INTO v_admin_count
+      FROM public.profiles AS profile
+      WHERE profile.role = 'admin';
+
+    IF v_admin_count <= 1 THEN
+      RAISE EXCEPTION 'The last administrator cannot be demoted.'
+        USING ERRCODE = '42501';
+    END IF;
+  END IF;
+
+  UPDATE public.profiles AS profile
+    SET role = p_new_role
+    WHERE profile.id = p_target_user_id;
+END;
+$function$;
+
+CREATE FUNCTION public.admin_correct_attendance(
+  p_attendance_id pg_catalog.uuid,
+  p_scanned_at pg_catalog.timestamptz
+)
+RETURNS pg_catalog.void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+SET row_security = off
+AS $function$
+DECLARE
+  v_actor_id pg_catalog.uuid;
+  v_actor_role pg_catalog.text;
+  v_before public.attendance%ROWTYPE;
+  v_after public.attendance%ROWTYPE;
+BEGIN
+  v_actor_id := auth.uid();
+
+  IF v_actor_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required.'
+      USING ERRCODE = '28000';
+  END IF;
+
+  SELECT profile.role
+    INTO v_actor_role
+    FROM public.profiles AS profile
+    WHERE profile.id = v_actor_id
+    FOR SHARE;
+
+  IF v_actor_role IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Administrator access is required.'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF p_attendance_id IS NULL OR p_scanned_at IS NULL THEN
+    RAISE EXCEPTION 'An attendance ID and corrected timestamp are required.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_scanned_at <= '-infinity'::pg_catalog.timestamptz
+     OR p_scanned_at >= 'infinity'::pg_catalog.timestamptz THEN
+    RAISE EXCEPTION 'The corrected timestamp must be finite.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT attendance.*
+    INTO v_before
+    FROM public.attendance
+    WHERE attendance.id = p_attendance_id
+    FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The attendance record does not exist.'
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  UPDATE public.attendance AS attendance
+    SET scanned_at = p_scanned_at
+    WHERE attendance.id = p_attendance_id
+    RETURNING attendance.* INTO v_after;
+
+  INSERT INTO public.attendance_audit_log (
+    actor_id,
+    action,
+    target_attendance_id,
+    before_data,
+    after_data
+  )
+  VALUES (
+    v_actor_id,
+    'correct',
+    p_attendance_id,
+    pg_catalog.to_jsonb(v_before),
+    pg_catalog.to_jsonb(v_after)
+  );
+END;
+$function$;
+
+CREATE FUNCTION public.admin_delete_attendance(
+  p_attendance_id pg_catalog.uuid
+)
+RETURNS pg_catalog.void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+SET row_security = off
+AS $function$
+DECLARE
+  v_actor_id pg_catalog.uuid;
+  v_actor_role pg_catalog.text;
+  v_before public.attendance%ROWTYPE;
+BEGIN
+  v_actor_id := auth.uid();
+
+  IF v_actor_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication is required.'
+      USING ERRCODE = '28000';
+  END IF;
+
+  SELECT profile.role
+    INTO v_actor_role
+    FROM public.profiles AS profile
+    WHERE profile.id = v_actor_id
+    FOR SHARE;
+
+  IF v_actor_role IS DISTINCT FROM 'admin' THEN
+    RAISE EXCEPTION 'Administrator access is required.'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF p_attendance_id IS NULL THEN
+    RAISE EXCEPTION 'An attendance ID is required.'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT attendance.*
+    INTO v_before
+    FROM public.attendance
+    WHERE attendance.id = p_attendance_id
+    FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The attendance record does not exist.'
+      USING ERRCODE = 'P0002';
+  END IF;
+
+  INSERT INTO public.attendance_audit_log (
+    actor_id,
+    action,
+    target_attendance_id,
+    before_data,
+    after_data
+  )
+  VALUES (
+    v_actor_id,
+    'delete',
+    p_attendance_id,
+    pg_catalog.to_jsonb(v_before),
+    NULL
+  );
+
+  DELETE FROM public.attendance
+    WHERE attendance.id = p_attendance_id;
+END;
+$function$;
+
+DO $admin_function_owner_check$
+DECLARE
+  v_executor_oid pg_catalog.oid;
+BEGIN
+  SELECT role.oid
+    INTO v_executor_oid
+    FROM pg_catalog.pg_roles AS role
+    WHERE role.rolname = current_user;
+
+  IF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_proc AS function_row
+      JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.oid = function_row.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND function_row.proname IN (
+          'admin_change_user_role',
+          'admin_correct_attendance',
+          'admin_delete_attendance'
+        )
+        AND (
+          function_row.proowner <> v_executor_oid
+          OR NOT function_row.prosecdef
+        )
+  ) OR (
+    SELECT pg_catalog.count(*)
+      FROM pg_catalog.pg_proc AS function_row
+      JOIN pg_catalog.pg_namespace AS namespace
+        ON namespace.oid = function_row.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND function_row.proname IN (
+          'admin_change_user_role',
+          'admin_correct_attendance',
+          'admin_delete_attendance'
+        )
+  ) <> 3 THEN
+    RAISE EXCEPTION
+      'Each admin SECURITY DEFINER function must be owned by the migration executor whose table privileges and RLS behavior were preflighted.';
+  END IF;
+END;
+$admin_function_owner_check$;
+
+REVOKE ALL PRIVILEGES
+  ON FUNCTION public.admin_change_user_role(pg_catalog.uuid, pg_catalog.text)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL PRIVILEGES
+  ON FUNCTION public.admin_correct_attendance(pg_catalog.uuid, pg_catalog.timestamptz)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL PRIVILEGES
+  ON FUNCTION public.admin_delete_attendance(pg_catalog.uuid)
+  FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE
+  ON FUNCTION public.admin_change_user_role(pg_catalog.uuid, pg_catalog.text)
+  TO authenticated;
+GRANT EXECUTE
+  ON FUNCTION public.admin_correct_attendance(pg_catalog.uuid, pg_catalog.timestamptz)
+  TO authenticated;
+GRANT EXECUTE
+  ON FUNCTION public.admin_delete_attendance(pg_catalog.uuid)
+  TO authenticated;
+
+COMMIT;

@@ -55,3 +55,13 @@ Scan QR code with Expo Go. Or press `W` for web.
 | QR won't scan | Phone + computer on same WiFi |
 | White screen | Wait 10s, or shake → Reload |
 | TypeScript errors | Run `npx tsc --noEmit` |
+
+---
+
+## ADMIN USER ROLE MANAGEMENT
+
+Review `supabase/migrations/20261021073100_admin_user_role_management.sql`
+and apply it manually in Supabase before using Change Role. It provides
+administrator-checked RPCs for listing users and changing roles without
+granting clients direct UPDATE access to `profiles.role` or changing existing
+RLS policies.

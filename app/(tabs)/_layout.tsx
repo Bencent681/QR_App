@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Tabs } from 'expo-router';
+import { useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+import { Tabs, usePathname, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { ActivityIndicator, View } from 'react-native';
 
@@ -9,21 +10,32 @@ import { getProfile, type Role } from '@/lib/profiles';
 
 export default function TabLayout() {
   const { user } = useAuth();
+  const pathname = usePathname();
+  const router = useRouter();
 
   const [role, setRole] = useState<Role | null>(null);
   const [loading, setLoading] = useState(true);
+  const previousRole = useRef<Role | null>(null);
 
   useEffect(() => {
     let active = true;
+    let loadingRole = false;
+    let hasResolvedRole = false;
 
     async function loadRole() {
+      if (loadingRole) return;
+      loadingRole = true;
       const startedAt = Date.now();
       console.log('TAB ROLE LOOKUP: Started', { hasUser: !!user });
-      setLoading(true);
-      setRole(null);
+      if (!hasResolvedRole) {
+        setLoading(true);
+        setRole(null);
+      }
 
       if (!user) {
         console.log('TAB ROLE LOOKUP: Skipped because there is no user');
+        hasResolvedRole = true;
+        loadingRole = false;
         setLoading(false);
         return;
       }
@@ -42,10 +54,12 @@ export default function TabLayout() {
       } catch (error) {
         console.log('LOAD ROLE ERROR:', error);
 
-        if (active) {
+        if (active && !hasResolvedRole) {
           setRole(null);
         }
       } finally {
+        hasResolvedRole = true;
+        loadingRole = false;
         if (active) {
           setLoading(false);
         }
@@ -57,11 +71,56 @@ export default function TabLayout() {
     }
 
     loadRole();
+    const refreshTimer = setInterval(() => {
+      if (AppState.currentState === 'active') {
+        void loadRole();
+      }
+    }, 30000);
+    const appStateSubscription = AppState.addEventListener(
+      'change',
+      (state) => {
+        if (state === 'active') {
+          void loadRole();
+        }
+      }
+    );
 
     return () => {
       active = false;
+      clearInterval(refreshTimer);
+      appStateSubscription.remove();
     };
   }, [user?.id]);
+
+  useEffect(() => {
+    if (!role) return;
+
+    const roleChanged = previousRole.current !== null &&
+      previousRole.current !== role;
+    previousRole.current = role;
+
+    if (roleChanged) {
+      router.replace('/(tabs)');
+      return;
+    }
+
+    const route = pathname.split('/').pop();
+    const adminOnlyRoutes = [
+      'admin',
+      'manage-users',
+      'event-monitoring',
+      'attendance-management',
+    ];
+    const studentOnlyRoutes = ['available-events', 'scan'];
+
+    if (
+      (adminOnlyRoutes.includes(route ?? '') && role !== 'admin') ||
+      (studentOnlyRoutes.includes(route ?? '') && role !== 'student') ||
+      (route === 'teacher' && role !== 'teacher')
+    ) {
+      router.replace('/(tabs)');
+    }
+  }, [pathname, role, router]);
 
   if (loading) {
     return (

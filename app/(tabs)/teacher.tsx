@@ -425,6 +425,11 @@ export default function TeacherScreen() {
   const handleCreateEvent = async () => {
     setMessage(null);
 
+    if (!user?.id) {
+      setMessage('You must be signed in to create an event.');
+      return;
+    }
+
     const event = {
       eventId: eventId.trim(),
       title: title.trim(),

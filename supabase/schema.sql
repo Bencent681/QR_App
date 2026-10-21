@@ -15,7 +15,7 @@ create table if not exists public.profiles (
   full_name  text,
   avatar_path text,
   role       text not null default 'student'
-             check (role in ('student', 'teacher')),
+             check (role in ('student', 'teacher', 'admin')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
