@@ -1,3 +1,4 @@
+
 {
   "expo": {
     "name": "QR-ATT",
@@ -31,9 +32,15 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow QR Attendance to select a profile picture from your photo library.",
-          "cameraPermission": false,
+           "photosPermission": "Allow QR Attendance to select a profile picture from your photo library.",
           "microphonePermission": false
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow QR Attendance to access the camera for scanning attendance QR codes.",
+          "recordAudioAndroid": false
         }
       ],
       [
